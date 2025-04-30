@@ -30,15 +30,22 @@ func main() {
 	// We'll schedule a test pattern for 10 seconds, then a file for 10 seconds, then back to test pattern
 	streamScheduler.AddItem(scheduler.StreamItem{
 		Type:     "file",
-		Source:   "videos/input.mp4", // First video file
+		Source:   "videos/output.mp4", // First video file
 		Start:    now,
 		Duration: 10 * time.Second,
 	})
 
 	streamScheduler.AddItem(scheduler.StreamItem{
 		Type:     "file",
-		Source:   "videos/input2.mp4", // Second video file
+		Source:   "videos/output2.mp4", // Second video file
 		Start:    now.Add(10 * time.Second),
+		Duration: 10 * time.Second,
+	})
+
+	streamScheduler.AddItem(scheduler.StreamItem{
+		Type:     "file",
+		Source:   "videos/output3.mp4", // Second video file
+		Start:    now.Add(20 * time.Second),
 		Duration: 10 * time.Second,
 	})
 

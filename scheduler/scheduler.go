@@ -287,51 +287,38 @@ func (s *StreamScheduler) Start() error {
 func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 	fmt.Printf("Adding file source for %s at index %d\n", filePath, index)
 	
-	// Instead of uridecodebin, let's use a more explicit pipeline for better control
-	filesrc, err := gst.NewElement("filesrc")
+	// Create a valve element to control the flow
+	valve, err := gst.NewElement("valve")
 	if err != nil {
-		return fmt.Errorf("failed to create filesrc: %v", err)
+		return fmt.Errorf("failed to create valve: %v", err)
 	}
-	filesrc.SetProperty("name", fmt.Sprintf("filesrc%d", index))
+	valve.SetProperty("name", fmt.Sprintf("valve%d", index))
+	valve.SetProperty("drop", true) // Start with valve closed
 	
-	// Make sure to handle relative paths
+	// Use uridecodebin instead of filesrc+typefind+decodebin
+	uridecodebin, err := gst.NewElement("uridecodebin")
+	if err != nil {
+		return fmt.Errorf("failed to create uridecodebin: %v", err)
+	}
+	uridecodebin.SetProperty("name", fmt.Sprintf("decode%d", index))
+	
+	// Make sure to handle relative paths and convert to URI
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %v", err)
 	}
 	
-	filesrc.SetProperty("location", absPath)
-	filesrc.SetProperty("buffer-size", 10485760) // 10MB buffer
-	
-	// Add typefind to detect file type
-	typefind, err := gst.NewElement("typefind")
-	if err != nil {
-		return fmt.Errorf("failed to create typefind: %v", err)
-	}
-	
-	// Add decodebin to handle decoding
-	decodebin, err := gst.NewElement("decodebin")
-	if err != nil {
-		return fmt.Errorf("failed to create decodebin: %v", err)
-	}
-	decodebin.SetProperty("name", fmt.Sprintf("decode%d", index))
+	// Convert file path to URI
+	fileURI := fmt.Sprintf("file://%s", absPath)
+	uridecodebin.SetProperty("uri", fileURI)
+	uridecodebin.SetProperty("buffer-size", 10485760) // 10MB buffer
 	
 	// Add elements to pipeline
-	s.pipeline.Add(filesrc)
-	s.pipeline.Add(typefind)
-	s.pipeline.Add(decodebin)
+	s.pipeline.Add(valve)
+	s.pipeline.Add(uridecodebin)
 	
-	// Link filesrc -> typefind -> decodebin
-	filesrc.Link(typefind)
-	typefind.Link(decodebin)
-	
-	// Connect to typefind's "have-type" signal for debugging
-	typefind.Connect("have-type", func(self *gst.Element, probability uint, caps *gst.Caps) {
-		fmt.Printf("File type detected: %s (probability: %d)\n", caps.String(), probability)
-	})
-	
-	// Connect to decodebin's pad-added signal
-	decodebin.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
+	// Connect to uridecodebin's pad-added signal
+	uridecodebin.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		caps := pad.CurrentCaps()
 		if caps == nil {
 			fmt.Printf("Warning: Pad has no caps\n")
@@ -345,7 +332,7 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 		}
 		
 		name := structure.Name()
-		fmt.Printf("Decodebin pad added with caps: %s\n", caps.String())
+		fmt.Printf("Uridecodebin pad added with caps: %s\n", caps.String())
 		
 		if len(name) >= 5 && name[:5] == "video" {
 			// Handle video pad
@@ -383,19 +370,8 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 		}
 	})
 	
-	// Connect to decodebin's no-more-pads signal for debugging
-	decodebin.Connect("no-more-pads", func(self *gst.Element) {
-		fmt.Printf("Decodebin has no more pads\n")
-	})
-	
-	// Connect to decodebin's autoplug-select signal to help with format selection
-	decodebin.Connect("autoplug-select", func(self *gst.Element, pad *gst.Pad, caps *gst.Caps, factory *gst.ElementFactory) int {
-		fmt.Printf("Autoplug select for %s: %s\n", factory.GetName(), caps.String())
-		return 0 // GST_AUTOPLUG_SELECT_TRY
-	})
-	
 	// Store sources for later reference
-	s.sources[index] = append(s.sources[index], filesrc, typefind, decodebin)
+	s.sources[index] = append(s.sources[index], uridecodebin, valve)
 	
 	return nil
 }
@@ -444,6 +420,38 @@ func (s *StreamScheduler) switchToSource(index int) {
 
 	// This needs to be executed in the main loop's context
 	glib.IdleAdd(func() bool {
+		// First seek the source to the beginning
+		if elements, ok := s.sources[index]; ok && len(elements) > 0 {
+			// Find the uridecodebin element
+			var uridecodebin *gst.Element
+			for _, elem := range elements {
+				if name := elem.GetName(); name == fmt.Sprintf("decode%d", index) {
+					uridecodebin = elem
+					break
+				}
+			}
+			
+			if uridecodebin != nil {
+				// Create a seek event to position at the start (0 nanoseconds)
+				seekEvent := gst.NewSeekEvent(
+					1.0,                           // rate
+					gst.FormatTime,               // format
+					gst.SeekFlagFlush|gst.SeekFlagAccurate, // flags
+					gst.SeekTypeSet,              // start type
+					0,                            // start position (0 nanoseconds)
+					gst.SeekTypeNone,             // stop type
+					-1,                           // stop position (none)
+				)
+				
+				// Send the seek event to the element
+				fmt.Printf("Seeking source %d to beginning\n", index)
+				if !uridecodebin.SendEvent(seekEvent) {
+					fmt.Printf("Failed to seek source %d to beginning\n", index)
+				}
+			}
+		}
+
+		// Then switch the selectors to the appropriate pads
 		sinkVideo := s.vselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
 		if sinkVideo != nil {
 			s.vselector.SetProperty("active-pad", sinkVideo)
