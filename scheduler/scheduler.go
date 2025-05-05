@@ -107,8 +107,20 @@ func (s *StreamScheduler) RunSchedule() error {
 			return nil, fmt.Errorf("failed to create filesrc: %v", err)
 		}
 		filesrc.SetProperty("location", item.Source)
-		filesrc.SetProperty("blocksize", 655360) // Increase block size for faster reading
-		filesrc.SetProperty("num-buffers", 1000) // Pre-buffer more data
+		filesrc.SetProperty("blocksize", 1048576) // Increase to 1MB for better buffering
+		filesrc.SetProperty("num-buffers", -1)    // No limit on buffers
+
+		// Add a queue before decodebin for better buffering
+		sourceQueue, err := gst.NewElement("queue")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sourceQueue: %v", err)
+		}
+		sourceQueue.SetProperty("max-size-buffers", 0)
+		sourceQueue.SetProperty("max-size-bytes", 0)
+		sourceQueue.SetProperty("max-size-time", uint64(10*time.Second)) // 10 second buffer
+
+		// Add to pipeline
+		pipeline.Add(sourceQueue)
 
 		decodebin, err := gst.NewElement("decodebin")
 		if err != nil {
@@ -256,6 +268,7 @@ func (s *StreamScheduler) RunSchedule() error {
 		rtpQueue.SetProperty("leaky", 2)
 		// Add all elements to pipeline
 		pipeline.Add(filesrc)
+		pipeline.Add(sourceQueue)
 		pipeline.Add(decodebin)
 		pipeline.Add(videoIdentity)
 		pipeline.Add(audioIdentity)
@@ -274,8 +287,9 @@ func (s *StreamScheduler) RunSchedule() error {
 		pipeline.Add(udpsink)
 		pipeline.Add(rtpQueue)
 
-		// Link filesrc to decodebin
-		filesrc.Link(decodebin)
+		// Link filesrc to sourceQueue
+		filesrc.Link(sourceQueue)
+		sourceQueue.Link(decodebin)
 		rtpmp2tpay.Link(rtpQueue)
 		rtpQueue.Link(udpsink)
 
@@ -364,8 +378,9 @@ func (s *StreamScheduler) RunSchedule() error {
 					gerr := msg.ParseWarning()
 					fmt.Printf("Warning from element %s: %s\n", msg.Source(), gerr.Error())
 				case gst.MessageEOS:
-					fmt.Println("End of stream")
-					return
+					fmt.Printf("[%s] End of stream received from %s - ignoring to continue playback\n",
+						time.Now().Format("15:04:05.000"), msg.Source())
+					// Don't do anything with EOS, let the duration timer handle switching
 				}
 			}
 		}()
@@ -441,19 +456,23 @@ func (s *StreamScheduler) RunSchedule() error {
 		durationReached := make(chan struct{})
 		go func() {
 			startTime := time.Now()
-			for time.Since(startTime) < item.Duration*3 { // Triple duration as safety
+			targetDuration := item.Duration
+
+			// Use wall clock as backup if pipeline position doesn't work
+			for time.Since(startTime) < targetDuration*2 { // Double duration as safety
 				// Query pipeline position
 				ok, position := currentPipeline.QueryPosition(gst.FormatTime)
 				if ok && position > 0 {
 					positionNs := position
-					durationNs := int64(item.Duration.Nanoseconds())
+					durationNs := int64(targetDuration.Nanoseconds())
 
 					// Log position for debugging
 					if positionNs%(1000000000) < 50000000 { // Log every second
-						fmt.Printf("[%s] Item %d: Position: %.2fs / %.2fs\n",
+						fmt.Printf("[%s] Item %d: Position: %.2fs / %.2fs (Elapsed: %.2fs)\n",
 							time.Now().Format("15:04:05.000"), i,
 							float64(positionNs)/1000000000.0,
-							float64(durationNs)/1000000000.0)
+							float64(durationNs)/1000000000.0,
+							time.Since(startTime).Seconds())
 					}
 
 					// If we've reached or exceeded the specified duration, stop playback
@@ -464,16 +483,51 @@ func (s *StreamScheduler) RunSchedule() error {
 						close(durationReached)
 						return
 					}
+				} else {
+					// If we can't query position, use wall clock as fallback
+					if time.Since(startTime) >= targetDuration {
+						fmt.Printf("[%s] Item %d: Duration reached via wall clock\n",
+							time.Now().Format("15:04:05.000"), i)
+						close(durationReached)
+						return
+					}
 				}
-				time.Sleep(20 * time.Millisecond) // Check position more frequently
+				time.Sleep(20 * time.Millisecond) // Check position frequently
 			}
-		}()
 
-		// Wait for duration reached or stop signal - NO FALLBACK TIMER
+			// Fallback - if we get here, use wall clock
+			fmt.Printf("[%s] Item %d: Fallback - using wall clock\n",
+				time.Now().Format("15:04:05.000"), i)
+			close(durationReached)
+		}()
+		// Wait for duration reached or stop signal
 		select {
 		case <-durationReached:
 			fmt.Printf("[%s] Item %d: Duration reached via position monitoring\n",
 				time.Now().Format("15:04:05.000"), i)
+
+			// If there's a next pipeline ready, start it BEFORE stopping the current one
+			if i+1 < len(items) && nextPipelineReady {
+				nextPipelineMutex.Lock()
+				if nextPipelineReady && nextPipeline != nil {
+					fmt.Printf("[%s] Starting next pipeline before stopping current\n",
+						time.Now().Format("15:04:05.000"))
+
+					// Set the next pipeline as current
+					s.mutex.Lock()
+					nextPipeline.SetState(gst.StatePlaying)
+					s.pipeline = nextPipeline
+					s.mutex.Unlock()
+
+					// Small overlap to ensure smooth transition
+					time.Sleep(200 * time.Millisecond)
+				}
+				nextPipelineMutex.Unlock()
+			}
+
+			// Now stop the current pipeline
+			currentPipeline.SetState(gst.StateNull)
+
 		case <-s.stopChan:
 			fmt.Printf("[%s] Item %d: Received stop signal during playback\n",
 				time.Now().Format("15:04:05.000"), i)
