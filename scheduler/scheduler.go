@@ -95,26 +95,41 @@ func (s *StreamScheduler) RunSchedule() error {
 		fmt.Printf("[%s] Preparing pipeline for item %d\n",
 			time.Now().Format("15:04:05.000"), index)
 
-		// Create a new pipeline
+		// Create a new pipeline with a unique name
 		pipeline, err := gst.NewPipeline(fmt.Sprintf("streaming-pipeline-%d", index))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create pipeline: %v", err)
 		}
 
-		// Create source elements
+		// Create decodebin with unique name
+		decodebin, err := gst.NewElement("decodebin")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create decodebin: %v", err)
+		}
+		decodebin.SetProperty("name", fmt.Sprintf("decodebin-%d", index))
+
+		// Add decodebin to pipeline BEFORE linking
+		pipeline.Add(decodebin)
+
+		// Create source elements with unique names
 		filesrc, err := gst.NewElement("filesrc")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create filesrc: %v", err)
 		}
+		filesrc.SetProperty("name", fmt.Sprintf("filesrc-%d", index))
 		filesrc.SetProperty("location", item.Source)
 		filesrc.SetProperty("blocksize", 1048576) // Increase to 1MB for better buffering
 		filesrc.SetProperty("num-buffers", -1)    // No limit on buffers
+
+		// Add filesrc to pipeline
+		pipeline.Add(filesrc)
 
 		// Add a queue before decodebin for better buffering
 		sourceQueue, err := gst.NewElement("queue")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create sourceQueue: %v", err)
 		}
+		sourceQueue.SetProperty("name", fmt.Sprintf("sourceQueue123-%d", index))
 		sourceQueue.SetProperty("max-size-buffers", 0)
 		sourceQueue.SetProperty("max-size-bytes", 0)
 		sourceQueue.SetProperty("max-size-time", uint64(10*time.Second)) // 10 second buffer
@@ -122,27 +137,29 @@ func (s *StreamScheduler) RunSchedule() error {
 		// Add to pipeline
 		pipeline.Add(sourceQueue)
 
-		decodebin, err := gst.NewElement("decodebin")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create decodebin: %v", err)
-		}
+		// Now link the elements after they've all been added to the pipeline
+		filesrc.Link(sourceQueue)
+		sourceQueue.Link(decodebin)
 
-		// Create identity elements for synchronization
+		// Create identity elements with unique names
 		videoIdentity, err := gst.NewElement("identity")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create video identity: %v", err)
 		}
+		videoIdentity.SetProperty("name", fmt.Sprintf("videoIdentity-%d", index))
 
 		audioIdentity, err := gst.NewElement("identity")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create audio identity: %v", err)
 		}
+		audioIdentity.SetProperty("name", fmt.Sprintf("audioIdentity-%d", index))
 
-		// Create video conversion elements
+		// Create video conversion elements with unique names
 		videoconv, err := gst.NewElement("videoconvert")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create videoconv: %v", err)
 		}
+		videoconv.SetProperty("name", fmt.Sprintf("videoconv-%d", index))
 
 		videoscale, err := gst.NewElement("videoscale")
 		if err != nil {
@@ -155,23 +172,28 @@ func (s *StreamScheduler) RunSchedule() error {
 			return nil, fmt.Errorf("failed to create videocaps: %v", err)
 		}
 
-		// Set video to 720p max resolution at 30fps
-		capstr := "video/x-raw,width=(int)[1,1920],height=(int)[1,1080],framerate=(fraction)[1/1,30/1]"
+		// Set video to support higher framerates (up to 60fps)
+		capstr := "video/x-raw,width=(int)[1,1920],height=(int)[1,1080],framerate=(fraction)[1/1,60/1]"
 		caps := gst.NewCapsFromString(capstr)
 		videocaps.SetProperty("caps", caps)
 
-		// Create H.264 encoder and parser
+		// Create H.264 encoder and parser with settings to handle high framerates
 		h264enc, err := gst.NewElement("x264enc")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create h264enc: %v", err)
 		}
+		h264enc.SetProperty("Name", fmt.Sprintf("h264enc-%d", index))
 		h264enc.SetProperty("tune", "zerolatency")
-		h264enc.SetProperty("bitrate", 2000)             // 2Mbps
-		h264enc.SetProperty("key-int-max", 30)           // Key frame every 30 frames
-		h264enc.SetProperty("byte-stream", true)         // Use byte stream format
-		h264enc.SetProperty("speed-preset", "superfast") // Faster encoding
-		h264enc.SetProperty("threads", 4)                // Use 4 threads
+		h264enc.SetProperty("bitrate", 20000)  // 4Mbps
+		h264enc.SetProperty("key-int-max", 60) // Key frame every 60 frames
+		// h264enc.SetProperty("byte-stream", true)        // Use byte stream format
+		h264enc.SetProperty("speed-preset", "veryfast") // Faster encoding
+		h264enc.SetProperty("threads", 4)               // Use 4 threads
+		h264enc.SetProperty("vbv-buf-capacity", 2000)   // 2000ms VBV buffer
+		// Set to constant framerate output
+		// h264enc.SetProperty("option-string", "force-cfr=1")
 
+		// Try using a different H.264 parser that might handle high framerates better
 		h264parse, err := gst.NewElement("h264parse")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create h264parse: %v", err)
@@ -221,6 +243,8 @@ func (s *StreamScheduler) RunSchedule() error {
 		}
 		finalIdentity.SetProperty("single-segment", true)
 		finalIdentity.SetProperty("sync", true)
+		streamid := fmt.Sprintf("stream-%d", index)
+		finalIdentity.SetProperty("stream-id", streamid)
 
 		// Create RTP payloader for MPEG-TS
 		rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
@@ -244,6 +268,7 @@ func (s *StreamScheduler) RunSchedule() error {
 		udpsink.SetProperty("sync", false)         // Don't sync to clock
 		udpsink.SetProperty("async", false)        // Don't use async buffering
 		udpsink.SetProperty("buffer-size", 262144) // Smaller buffer (256KB)
+		udpsink.SetProperty("stream-id", streamid)
 
 		// Reduce latency in mpegtsmux
 		mpegtsmux.SetProperty("latency", 0) // Minimize muxer latency
@@ -267,9 +292,17 @@ func (s *StreamScheduler) RunSchedule() error {
 		rtpQueue.SetProperty("max-size-time", uint64(500*time.Microsecond))
 		rtpQueue.SetProperty("leaky", 2)
 		// Add all elements to pipeline
-		pipeline.Add(filesrc)
-		pipeline.Add(sourceQueue)
-		pipeline.Add(decodebin)
+		// Add a queue before the audio encoder to prevent buffer disappearance
+		audioQueue, err := gst.NewElement("queue")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create audioQueue: %v", err)
+		}
+		audioQueue.SetProperty("max-size-buffers", 100)
+		audioQueue.SetProperty("max-size-time", uint64(500*time.Millisecond))
+
+		// Add the queue to the pipeline
+		pipeline.Add(audioQueue)
+
 		pipeline.Add(videoIdentity)
 		pipeline.Add(audioIdentity)
 		pipeline.Add(videoconv)
@@ -292,11 +325,9 @@ func (s *StreamScheduler) RunSchedule() error {
 		sourceQueue.Link(decodebin)
 		rtpmp2tpay.Link(rtpQueue)
 		rtpQueue.Link(udpsink)
-
-		// Set up bus to watch for messages
 		bus := pipeline.GetBus()
 
-		// Connect to decodebin's pad-added signal
+		// Connect to demuxer's pad-added signal
 		decodebin.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
 			caps := pad.CurrentCaps()
 			if caps == nil {
@@ -330,7 +361,7 @@ func (s *StreamScheduler) RunSchedule() error {
 				videoscale.Link(videocaps)
 				videocaps.Link(h264enc)
 				h264enc.Link(h264parse)
-				h264parse.Link(mpegtsmux)
+				h264parse.Link(mpegtsmux) // Link directly to muxer
 
 			} else if len(name) >= 5 && name[:5] == "audio" {
 				// Link audio path
@@ -351,7 +382,8 @@ func (s *StreamScheduler) RunSchedule() error {
 				audioIdentity.Link(audioconv)
 				audioconv.Link(audioresample)
 				audioresample.Link(audiocaps)
-				audiocaps.Link(aacenc)
+				audiocaps.Link(audioQueue)
+				audioQueue.Link(aacenc)
 				aacenc.Link(mpegtsmux)
 			}
 		})
