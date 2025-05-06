@@ -241,6 +241,15 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
 
+	rtpJitterBuffer, err := gst.NewElementWithProperties("rtpjitterbuffer", map[string]interface{}{
+		"latency":         100,
+		"drop-on-latency": true,
+		"do-lost":         true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create rtpjitterbuffer: %v", err)
+	}
+
 	sinkProps := map[string]interface{}{
 		"host":         s.host,
 		"port":         s.port,
@@ -268,7 +277,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	var debugQueue *gst.Element
 	var debugFileSink *gst.Element
 
-	pipeline.AddMany(tee, s.muxer, rtpQueue, rtpmp2tpay, udpsink)
+	pipeline.AddMany(tee, s.muxer, rtpQueue, rtpmp2tpay, rtpJitterBuffer, udpsink)
 
 	if debugEnabled {
 		pipeline.AddMany(debugQueue, debugFileSink)
@@ -291,7 +300,8 @@ func (s *StreamScheduler) createMainPipeline() error {
 	}
 
 	rtpQueue.Link(rtpmp2tpay)
-	rtpmp2tpay.Link(udpsink)
+	rtpmp2tpay.Link(rtpJitterBuffer)
+	rtpJitterBuffer.Link(udpsink)
 
 	bus := pipeline.GetBus()
 	go func() {
@@ -511,24 +521,47 @@ func (s *StreamScheduler) switchBin() error {
 	if s.currentBin != nil {
 		fmt.Printf("[%s] Cleaning up current bin\n", time.Now().Format("15:04:05.000"))
 
-		// First set state to NULL to release resources
+		// Send EOS to both video and audio queues
+		eos := gst.NewEOSEvent()
+		if s.currentBin.VideoQueue != nil {
+			pad := s.currentBin.VideoQueue.GetStaticPad("sink")
+			if pad != nil {
+				pad.SendEvent(eos)
+			}
+		}
+		if s.currentBin.AudioQueue != nil {
+			pad := s.currentBin.AudioQueue.GetStaticPad("sink")
+			if pad != nil {
+				pad.SendEvent(eos)
+			}
+		}
+
+		// Wait for EOS message on the bus
+		bus := s.pipeline.GetBus()
+		for {
+			msg := bus.TimedPopFiltered(gst.ClockTime(2*time.Second), gst.MessageEOS)
+			if msg != nil && msg.Type() == gst.MessageEOS {
+				break
+			}
+		}
+
+		// FLUSH the muxer to clear any buffered data
+		muxerPad := s.muxer.GetStaticPad("sink")
+		if muxerPad != nil {
+			muxerPad.SendEvent(gst.NewFlushStartEvent())
+			muxerPad.SendEvent(gst.NewFlushStopEvent(false))
+		}
+
+		// Set state to NULL to release resources
 		err := s.currentBin.Bin.SetState(gst.StateNull)
 		if err != nil {
 			fmt.Printf("Warning: error setting current bin state to null: %v\n", err)
-			// Continue anyway as we need to switch bins
 		}
 
-		// Wait for state change to complete
-		time.Sleep(100 * time.Millisecond)
-		state, _ := s.currentBin.Bin.GetState(gst.StateNull, gst.ClockTime(3*time.Second))
-		fmt.Printf("[%s] Current bin state: %v\n",
-			time.Now().Format("15:04:05.000"), state)
-
-		// Then remove from pipeline
+		// Remove from pipeline
 		err = s.pipeline.Remove(s.currentBin.Bin.Element)
 		if err != nil {
 			fmt.Printf("Warning: error removing current bin: %v\n", err)
-			// Continue anyway as we need to switch bins
 		}
 	}
 
@@ -544,46 +577,11 @@ func (s *StreamScheduler) switchBin() error {
 		return fmt.Errorf("error adding bin to pipeline: %v", err)
 	}
 
-	// Set the bin state to ready first
-	fmt.Printf("[%s] Setting bin state to READY\n", time.Now().Format("15:04:05.000"))
-	err = s.currentBin.Bin.SetState(gst.StateReady)
-	if err != nil {
-		fmt.Printf("Warning: error setting bin state to ready: %v\n", err)
-		// Continue anyway and try to set to paused
-	}
-
-	// Wait for state change to complete
-	time.Sleep(100 * time.Millisecond)
-	state, _ := s.currentBin.Bin.GetState(gst.StateReady, gst.ClockTime(3*time.Second))
-	fmt.Printf("[%s] Bin state after READY: %v\n",
-		time.Now().Format("15:04:05.000"), state)
-
-	// Set to paused first to ensure preroll
-	fmt.Printf("[%s] Setting bin state to PAUSED\n", time.Now().Format("15:04:05.000"))
-	err = s.currentBin.Bin.SetState(gst.StatePaused)
-	if err != nil {
-		fmt.Printf("Warning: error setting bin state to paused: %v\n", err)
-		// Continue anyway and try to set to playing
-	}
-
-	// Wait for state change to complete
-	time.Sleep(100 * time.Millisecond)
-	pausedState, _ := s.currentBin.Bin.GetState(gst.StatePaused, gst.ClockTime(3*time.Second))
-	fmt.Printf("[%s] Bin state after PAUSED: %v\n",
-		time.Now().Format("15:04:05.000"), pausedState)
-
-	// Then set to playing
-	fmt.Printf("[%s] Setting bin state to PLAYING\n", time.Now().Format("15:04:05.000"))
+	// Set the bin state to playing
 	err = s.currentBin.Bin.SetState(gst.StatePlaying)
 	if err != nil {
 		return fmt.Errorf("error setting bin state to playing: %v", err)
 	}
-
-	// Wait for state change to complete
-	time.Sleep(100 * time.Millisecond)
-	playingState, _ := s.currentBin.Bin.GetState(gst.StatePlaying, gst.ClockTime(3*time.Second))
-	fmt.Printf("[%s] Bin state after PLAYING: %v\n",
-		time.Now().Format("15:04:05.000"), playingState)
 
 	fmt.Printf("[%s] Successfully switched to bin for item: %s\n",
 		time.Now().Format("15:04:05.000"), s.currentBin.Item.Source)
