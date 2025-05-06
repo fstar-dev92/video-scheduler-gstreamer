@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -18,15 +19,16 @@ type StreamItem struct {
 
 // StreamScheduler manages a GStreamer pipeline for scheduled playback
 type StreamScheduler struct {
-	host      string
-	port      int
-	items     []StreamItem
-	pipeline  *gst.Pipeline
-	mutex     sync.Mutex
-	stopChan  chan struct{}
-	running   bool
-	vselector *gst.Element
-	aselector *gst.Element
+	host             string
+	port             int
+	items            []StreamItem
+	pipeline         *gst.Pipeline
+	mutex            sync.Mutex
+	stopChan         chan struct{}
+	running          bool
+	vselector        *gst.Element
+	aselector        *gst.Element
+	lastEndTimestamp int64 // Track the last end timestamp for continuity
 }
 
 // NewStreamScheduler creates a new stream scheduler
@@ -102,296 +104,298 @@ func (s *StreamScheduler) RunSchedule() error {
 		}
 
 		// Create decodebin with unique name
+		// Create source elements
+		filesrc, err := gst.NewElementWithProperties("filesrc", map[string]interface{}{
+			"location":  item.Source,
+			"blocksize": 1048576, // 1MB for better buffering
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create filesrc: %v", err)
+		}
+
+		// Create a queue before decodebin for better buffering
+		sourceQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+			"max-size-buffers": 0,
+			"max-size-bytes":   0,
+			"max-size-time":    uint64(10 * time.Second), // 10 second buffer
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sourceQueue: %v", err)
+		}
+
+		// Create decodebin
 		decodebin, err := gst.NewElement("decodebin")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create decodebin: %v", err)
 		}
-		decodebin.SetProperty("name", fmt.Sprintf("decodebin-%d", index))
 
-		// Add decodebin to pipeline BEFORE linking
-		pipeline.Add(decodebin)
+		// Add elements to pipeline
+		pipeline.AddMany(filesrc, sourceQueue, decodebin)
 
-		// Create source elements with unique names
-		filesrc, err := gst.NewElement("filesrc")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create filesrc: %v", err)
-		}
-		filesrc.SetProperty("name", fmt.Sprintf("filesrc-%d", index))
-		filesrc.SetProperty("location", item.Source)
-		filesrc.SetProperty("blocksize", 1048576) // Increase to 1MB for better buffering
-		filesrc.SetProperty("num-buffers", -1)    // No limit on buffers
-
-		// Add filesrc to pipeline
-		pipeline.Add(filesrc)
-
-		// Add a queue before decodebin for better buffering
-		sourceQueue, err := gst.NewElement("queue")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create sourceQueue: %v", err)
-		}
-		sourceQueue.SetProperty("name", fmt.Sprintf("sourceQueue123-%d", index))
-		sourceQueue.SetProperty("max-size-buffers", 0)
-		sourceQueue.SetProperty("max-size-bytes", 0)
-		sourceQueue.SetProperty("max-size-time", uint64(10*time.Second)) // 10 second buffer
-
-		// Add to pipeline
-		pipeline.Add(sourceQueue)
-
-		// Now link the elements after they've all been added to the pipeline
+		// Link elements
 		filesrc.Link(sourceQueue)
 		sourceQueue.Link(decodebin)
 
-		// Create identity elements with unique names
-		videoIdentity, err := gst.NewElement("identity")
+		// Create video processing elements
+		videoIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+			"sync": true,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create video identity: %v", err)
 		}
-		videoIdentity.SetProperty("name", fmt.Sprintf("videoIdentity-%d", index))
 
-		audioIdentity, err := gst.NewElement("identity")
+		videoConvert, err := gst.NewElement("videoconvert")
 		if err != nil {
-			return nil, fmt.Errorf("failed to create audio identity: %v", err)
+			return nil, fmt.Errorf("failed to create videoconvert: %v", err)
 		}
-		audioIdentity.SetProperty("name", fmt.Sprintf("audioIdentity-%d", index))
 
-		// Create video conversion elements with unique names
-		videoconv, err := gst.NewElement("videoconvert")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create videoconv: %v", err)
-		}
-		videoconv.SetProperty("name", fmt.Sprintf("videoconv-%d", index))
-
-		videoscale, err := gst.NewElement("videoscale")
+		videoScale, err := gst.NewElement("videoscale")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create videoscale: %v", err)
 		}
 
 		// Add capsfilter to limit video size and framerate
-		videocaps, err := gst.NewElement("capsfilter")
+		videoCaps := gst.NewCapsFromString("video/x-raw,width=(int)[1,1920],height=(int)[1,1080],framerate=(fraction)[1/1,60/1]")
+		videoCapsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+			"caps": videoCaps,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create videocaps: %v", err)
 		}
 
-		// Set video to support higher framerates (up to 60fps)
-		capstr := "video/x-raw,width=(int)[1,1920],height=(int)[1,1080],framerate=(fraction)[1/1,60/1]"
-		caps := gst.NewCapsFromString(capstr)
-		videocaps.SetProperty("caps", caps)
-
-		// Create H.264 encoder and parser with settings to handle high framerates
-		h264enc, err := gst.NewElement("x264enc")
+		// Create H.264 encoder with optimized settings
+		h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
+			"tune":             0,
+			"bitrate":          2000, // 2Mbps
+			"key-int-max":      60,   // Key frame every 60 frames
+			"speed-preset":     1,    // Faster encoding
+			"threads":          4,    // Use 4 threads
+			"vbv-buf-capacity": 2000, // 2000ms VBV buffer
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create h264enc: %v", err)
 		}
-		h264enc.SetProperty("Name", fmt.Sprintf("h264enc-%d", index))
-		h264enc.SetProperty("tune", "zerolatency")
-		h264enc.SetProperty("bitrate", 20000)  // 4Mbps
-		h264enc.SetProperty("key-int-max", 60) // Key frame every 60 frames
-		// h264enc.SetProperty("byte-stream", true)        // Use byte stream format
-		h264enc.SetProperty("speed-preset", "veryfast") // Faster encoding
-		h264enc.SetProperty("threads", 4)               // Use 4 threads
-		h264enc.SetProperty("vbv-buf-capacity", 2000)   // 2000ms VBV buffer
-		// Set to constant framerate output
-		// h264enc.SetProperty("option-string", "force-cfr=1")
 
-		// Try using a different H.264 parser that might handle high framerates better
 		h264parse, err := gst.NewElement("h264parse")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create h264parse: %v", err)
 		}
 
-		// Create audio conversion elements
-		audioconv, err := gst.NewElement("audioconvert")
+		// Create audio processing elements
+		audioIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+			"sync": true,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to create audioconv: %v", err)
+			return nil, fmt.Errorf("failed to create audio identity: %v", err)
 		}
 
-		audioresample, err := gst.NewElement("audioresample")
+		audioConvert, err := gst.NewElement("audioconvert")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create audioconvert: %v", err)
+		}
+
+		audioResample, err := gst.NewElement("audioresample")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create audioresample: %v", err)
 		}
 
 		// Add audio caps filter
-		audiocaps, err := gst.NewElement("capsfilter")
+		audioCaps := gst.NewCapsFromString("audio/x-raw,rate=44100,channels=2")
+		audioCapsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+			"caps": audioCaps,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create audiocaps: %v", err)
 		}
-		audiocapsstr := "audio/x-raw,rate=44100,channels=2"
-		acaps := gst.NewCapsFromString(audiocapsstr)
-		audiocaps.SetProperty("caps", acaps)
 
-		// Create AAC encoder
-		aacenc, err := gst.NewElement("avenc_aac")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create aacenc: %v", err)
-		}
-		aacenc.SetProperty("bitrate", 128000) // 128kbps audio
-
-		// Create MPEG-TS muxer
-		mpegtsmux, err := gst.NewElement("mpegtsmux")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
-		}
-		mpegtsmux.SetProperty("alignment", 7)                     // GST_MPEG_TS_MUX_ALIGNMENT_ALIGNED
-		mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100ms
-		mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100ms
-		mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20ms
-
-		// Create final identity element
-		finalIdentity, err := gst.NewElement("identity")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create final identity: %v", err)
-		}
-		finalIdentity.SetProperty("single-segment", true)
-		finalIdentity.SetProperty("sync", true)
-		streamid := fmt.Sprintf("stream-%d", index)
-		finalIdentity.SetProperty("stream-id", streamid)
-
-		// Create RTP payloader for MPEG-TS
-		rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
-		}
-		rtpmp2tpay.SetProperty("pt", 33) // Payload type for MPEG-TS
-
-		// Create UDP sink
-		udpsink, err := gst.NewElement("udpsink")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create udpsink: %v", err)
-		}
-		udpsink.SetProperty("host", s.host)
-		udpsink.SetProperty("port", s.port)
-		udpsink.SetProperty("auto-multicast", true)
-		// udpsink.SetProperty("buffer-size", 2097152)   // 2MB buffer size
-		udpsink.SetProperty("max-lateness", -1) // Don't drop late buffers
-		udpsink.SetProperty("ts-offset", 0)     // No timestamp offset
-
-		udpsink.SetProperty("sync", false)         // Don't sync to clock
-		udpsink.SetProperty("async", false)        // Don't use async buffering
-		udpsink.SetProperty("buffer-size", 262144) // Smaller buffer (256KB)
-		udpsink.SetProperty("stream-id", streamid)
-
-		// Reduce latency in mpegtsmux
-		mpegtsmux.SetProperty("latency", 0) // Minimize muxer latency
-
-		// Set low-latency tuning for h264enc
-		h264enc.SetProperty("tune", "zerolatency")
-		h264enc.SetProperty("speed-preset", "ultrafast")
-		h264enc.SetProperty("key-int-max", 15) // More frequent keyframes
-
-		// Set pipeline to low latency mode
-		pipeline.SetProperty("latency", 0)
-
-		// Configure identity elements
-		videoIdentity.SetProperty("sync", true)
-		audioIdentity.SetProperty("sync", true)
-		rtpQueue, err := gst.NewElement("queue")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create rtpQueue: %v", err)
-		}
-		rtpQueue.SetProperty("max-size-buffers", 200)
-		rtpQueue.SetProperty("max-size-time", uint64(500*time.Microsecond))
-		rtpQueue.SetProperty("leaky", 2)
-		// Add all elements to pipeline
-		// Add a queue before the audio encoder to prevent buffer disappearance
-		audioQueue, err := gst.NewElement("queue")
+		// Create a queue before the audio encoder
+		audioQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+			"max-size-buffers": 100,
+			"max-size-time":    uint64(500 * time.Millisecond),
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create audioQueue: %v", err)
 		}
-		audioQueue.SetProperty("max-size-buffers", 100)
-		audioQueue.SetProperty("max-size-time", uint64(500*time.Millisecond))
 
-		// Add the queue to the pipeline
-		pipeline.Add(audioQueue)
+		// Create AAC encoder
+		aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
+			"bitrate": 128000, // 128kbps audio
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create aacenc: %v", err)
+		}
 
-		pipeline.Add(videoIdentity)
-		pipeline.Add(audioIdentity)
-		pipeline.Add(videoconv)
-		pipeline.Add(videoscale)
-		pipeline.Add(videocaps)
-		pipeline.Add(h264enc)
-		pipeline.Add(h264parse)
-		pipeline.Add(audioconv)
-		pipeline.Add(audioresample)
-		pipeline.Add(audiocaps)
-		pipeline.Add(aacenc)
-		pipeline.Add(mpegtsmux)
-		pipeline.Add(finalIdentity)
-		pipeline.Add(rtpmp2tpay)
-		pipeline.Add(udpsink)
-		pipeline.Add(rtpQueue)
+		// Create MPEG-TS muxer
+		// Create MPEG-TS muxer
+		mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
+			"alignment":    7,                    // GST_MPEG_TS_MUX_ALIGNMENT_ALIGNED
+			"pat-interval": int64(100 * 1000000), // 100ms
+			"pmt-interval": int64(100 * 1000000), // 100ms
+			"pcr-interval": int64(20 * 1000000),  // 20ms
+			"latency":      0,                    // Minimize muxer latency
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
+		}
 
-		// Link filesrc to sourceQueue
-		filesrc.Link(sourceQueue)
-		sourceQueue.Link(decodebin)
-		rtpmp2tpay.Link(rtpQueue)
-		rtpQueue.Link(udpsink)
-		bus := pipeline.GetBus()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sync identity: %v", err)
+		}
+
+		// Create a tee element to split the stream for multiple outputs
+		tee, err := gst.NewElement("tee")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create tee element: %v", err)
+		}
+
+		rtpQueue, err := gst.NewElement("queue")
+		if err != nil {
+			return nil, fmt.Errorf("could not create RTP queue: %v", err)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to create rtpQueue: %v", err)
+		}
+
+		// Create RTP payloader for MPEG-TS
+		rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
+			"pt":               33,   // Payload type for MPEG-TS
+			"mtu":              1400, // Standard MTU size for RTP
+			"ssrc":             0,    // Let GStreamer generate a random SSRC
+			"timestamp-offset": 0,    // Let GStreamer generate a random timestamp offset
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
+		}
+
+		// Create UDP sink with optimized settings for VLC compatibility
+		sinkProps := map[string]interface{}{
+			"host":         s.host,
+			"port":         s.port,
+			"max-lateness": -1,      // Don't drop late buffers
+			"ts-offset":    0,       // No timestamp offset
+			"sync":         true,    // Sync to the clock for better timing
+			"async":        false,   // Don't use async buffering
+			"buffer-size":  1048576, // Larger buffer (1MB) for stability
+		}
+
+		// Add multicast-specific settings if needed
+		isMulticast := net.ParseIP(s.host).IsMulticast()
+		if isMulticast {
+			sinkProps["auto-multicast"] = true
+			sinkProps["ttl"] = 64 // Standard TTL for multicast
+
+			// Don't specify a specific interface to avoid SO_BINDTODEVICE warnings
+			// Instead, use the system's default routing
+			fmt.Printf("Multicast stream detected, using default interface\n")
+		}
+
+		udpsink, err := gst.NewElementWithProperties("udpsink", sinkProps)
+		if err != nil {
+			return nil, fmt.Errorf("could not create udpsink: %v", err)
+		}
+
+		// Create debug branch elements (optional)
+		debugEnabled := false // Set to true to enable debug output
+		var debugQueue *gst.Element
+		var debugFileSink *gst.Element
+
+		// Add all elements to pipeline
+		pipeline.AddMany(videoIdentity, videoConvert, videoScale, videoCapsFilter, h264enc, h264parse)
+		pipeline.AddMany(audioIdentity, audioConvert, audioResample, audioCapsFilter, audioQueue, aacenc)
+		pipeline.AddMany(mpegtsmux, tee, rtpQueue, rtpmp2tpay, udpsink)
+
+		// Add debug elements if enabled
+		if debugEnabled {
+			pipeline.AddMany(debugQueue, debugFileSink)
+		}
 
 		// Connect to demuxer's pad-added signal
 		decodebin.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
 			caps := pad.CurrentCaps()
 			if caps == nil {
-				fmt.Printf("Warning: pad %s has no caps\n", pad.GetName())
+				fmt.Errorf("Warning: pad %s has no caps", pad.GetName())
 				return
 			}
 
 			structure := caps.GetStructureAt(0)
 			name := structure.Name()
 
-			fmt.Printf("Pad added with caps: %s\n", name)
+			fmt.Errorf("Pad added with caps: %s", name)
 
 			if len(name) >= 5 && name[:5] == "video" {
 				// Link video path
 				sinkpad := videoIdentity.GetStaticPad("sink")
 				if sinkpad == nil {
-					fmt.Println("Error: couldn't get sink pad from videoIdentity")
+					fmt.Errorf("Error: couldn't get sink pad from videoIdentity")
 					return
 				}
 
 				if pad.Link(sinkpad) != gst.PadLinkOK {
-					fmt.Println("Error: couldn't link video pad")
+					fmt.Errorf("Error: couldn't link video pad")
 					return
 				}
 
-				fmt.Println("Linked video pad successfully")
+				fmt.Errorf("Linked video pad successfully")
 
 				// Link the rest of the video path
-				videoIdentity.Link(videoconv)
-				videoconv.Link(videoscale)
-				videoscale.Link(videocaps)
-				videocaps.Link(h264enc)
+				videoIdentity.Link(videoConvert)
+				videoConvert.Link(videoScale)
+				videoScale.Link(videoCapsFilter)
+				videoCapsFilter.Link(h264enc)
 				h264enc.Link(h264parse)
-				h264parse.Link(mpegtsmux) // Link directly to muxer
+				h264parse.Link(mpegtsmux)
 
 			} else if len(name) >= 5 && name[:5] == "audio" {
 				// Link audio path
 				sinkpad := audioIdentity.GetStaticPad("sink")
 				if sinkpad == nil {
-					fmt.Println("Error: couldn't get sink pad from audioIdentity")
+					fmt.Errorf("Error: couldn't get sink pad from audioIdentity")
 					return
 				}
 
 				if pad.Link(sinkpad) != gst.PadLinkOK {
-					fmt.Println("Error: couldn't link audio pad")
+					fmt.Errorf("Error: couldn't link audio pad")
 					return
 				}
 
-				fmt.Println("Linked audio pad successfully")
+				fmt.Errorf("Linked audio pad successfully")
 
 				// Link the rest of the audio path
-				audioIdentity.Link(audioconv)
-				audioconv.Link(audioresample)
-				audioresample.Link(audiocaps)
-				audiocaps.Link(audioQueue)
+				audioIdentity.Link(audioConvert)
+				audioConvert.Link(audioResample)
+				audioResample.Link(audioCapsFilter)
+				audioCapsFilter.Link(audioQueue)
 				audioQueue.Link(aacenc)
 				aacenc.Link(mpegtsmux)
 			}
 		})
 
-		// Link muxer to final identity to RTP payloader to UDP sink
-		mpegtsmux.Link(finalIdentity)
-		finalIdentity.Link(rtpmp2tpay)
+		mpegtsmux.Link(tee)
+
+		teeSrcPad := tee.GetRequestPad("src_%u")
+		if teeSrcPad == nil {
+			fmt.Errorf("failed to get source pad from tee")
+		}
+
+		// Get the sink pad from the rtpQueue
+		queueSinkPad := rtpQueue.GetStaticPad("sink")
+		if queueSinkPad == nil {
+			fmt.Errorf("failed to get sink pad from rtpQueue")
+		}
+
+		// Link the tee to the queue
+
+		rtpQueue.Link(rtpmp2tpay)
+		// Link muxer to final elements
 		rtpmp2tpay.Link(udpsink)
+		linkRet := teeSrcPad.Link(queueSinkPad)
+		// Set up a message handler to catch errors
+
+		if linkRet != gst.PadLinkOK {
+			fmt.Errorf("error linking tee -> rtpQueue: %v", linkRet)
+		}
+		bus := pipeline.GetBus()
 
 		// Set up a message handler to catch errors
 		go func() {
@@ -441,6 +445,23 @@ func (s *StreamScheduler) RunSchedule() error {
 				nextPipelineReady = false
 				fmt.Printf("[%s] Using prepared pipeline for item %d\n",
 					time.Now().Format("15:04:05.000"), i)
+
+				// Set timestamp offset for continuity if we have a previous timestamp
+				if s.lastEndTimestamp > 0 {
+					// Find the tsoffset element
+					tsoffsetName := fmt.Sprintf("tsoffset-%d", i)
+					tsoffset, _ := currentPipeline.GetElementByName(tsoffsetName)
+					if tsoffset != nil {
+						// Calculate offset based on last pipeline's end timestamp
+						// This ensures timestamps continue from where the last pipeline left off
+						tsoffset.SetProperty("offset", s.lastEndTimestamp)
+						fmt.Printf("[%s] Set timestamp offset to %d for item %d\n",
+							time.Now().Format("15:04:05.000"), s.lastEndTimestamp, i)
+					} else {
+						fmt.Printf("[%s] Warning: Could not find tsoffset element '%s'\n",
+							time.Now().Format("15:04:05.000"), tsoffsetName)
+					}
+				}
 			}
 			nextPipelineMutex.Unlock()
 		}
@@ -489,6 +510,7 @@ func (s *StreamScheduler) RunSchedule() error {
 		go func() {
 			startTime := time.Now()
 			targetDuration := item.Duration
+			var lastPosition int64 = 0
 
 			// Use wall clock as backup if pipeline position doesn't work
 			for time.Since(startTime) < targetDuration*2 { // Double duration as safety
@@ -497,6 +519,7 @@ func (s *StreamScheduler) RunSchedule() error {
 				if ok && position > 0 {
 					positionNs := position
 					durationNs := int64(targetDuration.Nanoseconds())
+					lastPosition = positionNs // Store the last valid position
 
 					// Log position for debugging
 					if positionNs%(1000000000) < 50000000 { // Log every second
@@ -512,6 +535,12 @@ func (s *StreamScheduler) RunSchedule() error {
 						fmt.Printf("[%s] Item %d: Reached specified duration %.2fs\n",
 							time.Now().Format("15:04:05.000"), i,
 							float64(durationNs)/1000000000.0)
+
+						// Store the last timestamp for the next pipeline
+						s.mutex.Lock()
+						s.lastEndTimestamp = lastPosition
+						s.mutex.Unlock()
+
 						close(durationReached)
 						return
 					}
@@ -520,6 +549,14 @@ func (s *StreamScheduler) RunSchedule() error {
 					if time.Since(startTime) >= targetDuration {
 						fmt.Printf("[%s] Item %d: Duration reached via wall clock\n",
 							time.Now().Format("15:04:05.000"), i)
+
+						// If we have a last position, use it
+						if lastPosition > 0 {
+							s.mutex.Lock()
+							s.lastEndTimestamp = lastPosition
+							s.mutex.Unlock()
+						}
+
 						close(durationReached)
 						return
 					}
@@ -530,6 +567,14 @@ func (s *StreamScheduler) RunSchedule() error {
 			// Fallback - if we get here, use wall clock
 			fmt.Printf("[%s] Item %d: Fallback - using wall clock\n",
 				time.Now().Format("15:04:05.000"), i)
+
+			// If we have a last position, use it
+			if lastPosition > 0 {
+				s.mutex.Lock()
+				s.lastEndTimestamp = lastPosition
+				s.mutex.Unlock()
+			}
+
 			close(durationReached)
 		}()
 		// Wait for duration reached or stop signal
