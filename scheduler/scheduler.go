@@ -490,8 +490,8 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 		return nil, fmt.Errorf("failed to get sink pad from audioconvert")
 	}
 
-	ghostpad := gst.NewGhostPad("sink", sinkpad)
-	if ghostpad == nil {
+	audio_ghostpad := gst.NewGhostPad("sink", audio_sinkpad)
+	if audio_ghostpad == nil {
 		return nil, fmt.Errorf("failed to create ghost pad")
 	}
 
