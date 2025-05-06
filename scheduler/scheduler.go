@@ -31,6 +31,7 @@ type StreamScheduler struct {
 	items           []StreamItem
 	mainPipeline    *gst.Pipeline
 	sourcePipelines []*gst.Pipeline
+	compositor      *gst.Element
 	mutex           sync.Mutex
 	stopChan        chan struct{}
 	switchNext      chan struct{}
@@ -145,9 +146,31 @@ func (s *StreamScheduler) createMainPipeline() error {
 	}
 
 	// Create video mixer (compositor)
-	compositor, err := gst.NewElement("compositor")
+	s.compositor, err = gst.NewElementWithProperties("compositor", map[string]interface{}{
+		"background":            1, // black background
+		"zero-size-is-unscaled": true,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create compositor: %v", err)
+	}
+
+	// Configure compositor sink pads for proper positioning
+	pad1 := s.compositor.GetStaticPad("sink_0")
+	if pad1 != nil {
+		pad1.SetProperty("xpos", 0)
+		pad1.SetProperty("ypos", 0)
+		pad1.SetProperty("width", 1920)
+		pad1.SetProperty("height", 1080)
+		pad1.SetProperty("alpha", 1.0) // input1 visible
+	}
+
+	pad2 := s.compositor.GetStaticPad("sink_1")
+	if pad2 != nil {
+		pad2.SetProperty("xpos", 0)
+		pad2.SetProperty("ypos", 0)
+		pad2.SetProperty("width", 1920)
+		pad2.SetProperty("height", 1080)
+		pad2.SetProperty("alpha", 0.0) // input2 hidden
 	}
 
 	// Create video converter and encoder
@@ -343,7 +366,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
 
 	// Add all elements to the pipeline
-	pipeline.AddMany(intervideo1, intervideo2, compositor, videoconv, h264enc)
+	pipeline.AddMany(intervideo1, intervideo2, s.compositor, videoconv, h264enc)
 	pipeline.AddMany(interaudio1, interaudio2, audiomixer, audioconv, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
 	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
@@ -351,10 +374,10 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	// Link video elements
 	intervideo1.Link(videoQueue1)
-	videoQueue1.Link(compositor)
+	videoQueue1.Link(s.compositor)
 	intervideo2.Link(videoQueue2)
-	videoQueue2.Link(compositor)
-	compositor.Link(videoMixerQueue)
+	videoQueue2.Link(s.compositor)
+	s.compositor.Link(videoMixerQueue)
 	videoMixerQueue.Link(videoconv)
 	videoconv.Link(h264enc)
 	h264enc.Link(muxerQueue)
@@ -490,8 +513,8 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 		return nil, fmt.Errorf("failed to get sink pad from audioconvert")
 	}
 
-	audio_ghostpad := gst.NewGhostPad("sink", audio_sinkpad)
-	if audio_ghostpad == nil {
+	ghostpad := gst.NewGhostPad("sink", sinkpad)
+	if ghostpad == nil {
 		return nil, fmt.Errorf("failed to create ghost pad")
 	}
 
@@ -600,6 +623,25 @@ func (s *StreamScheduler) playCurrentItem(items []StreamItem) {
 					time.Now().Format("15:04:05.000"))
 			}
 		}(items[s.currentIndex].Offset)
+	}
+
+	// Toggle visibility based on current channel
+	if channel == "input1" {
+
+		pad1 := s.compositor.GetStaticPad("sink_0")
+		pad2 := s.compositor.GetStaticPad("sink_1")
+		if pad1 != nil && pad2 != nil {
+			pad1.SetProperty("alpha", 1.0) // Show input1
+			pad2.SetProperty("alpha", 0.0) // Hide input2
+		}
+	} else {
+
+		pad1 := s.compositor.GetStaticPad("sink_0")
+		pad2 := s.compositor.GetStaticPad("sink_1")
+		if pad1 != nil && pad2 != nil {
+			pad1.SetProperty("alpha", 0.0) // Hide input1
+			pad2.SetProperty("alpha", 1.0) // Show input2
+		}
 	}
 }
 
