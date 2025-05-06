@@ -3,7 +3,6 @@ package scheduler
 
 import (
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -27,17 +26,16 @@ type Bin struct {
 }
 
 type StreamScheduler struct {
-	host       string
-	port       int
-	items      []StreamItem
-	pipeline   *gst.Pipeline
-	mutex      sync.Mutex
-	stopChan   chan struct{}
-	switchNext chan struct{}
-	running    bool
-	muxer      *gst.Element
-	currentBin *Bin
-	nextBin    *Bin
+	host            string
+	port            int
+	items           []StreamItem
+	mainPipeline    *gst.Pipeline
+	sourcePipelines []*gst.Pipeline
+	mutex           sync.Mutex
+	stopChan        chan struct{}
+	switchNext      chan struct{}
+	running         bool
+	currentIndex    int
 }
 
 func NewStreamScheduler(host string, port int) (*StreamScheduler, error) {
@@ -48,7 +46,7 @@ func NewStreamScheduler(host string, port int) (*StreamScheduler, error) {
 		port:       port,
 		items:      make([]StreamItem, 0),
 		stopChan:   make(chan struct{}),
-		switchNext: make(chan struct{}),
+		switchNext: make(chan struct{}, 5), // Buffered channel to prevent blocking
 	}, nil
 }
 
@@ -74,235 +72,317 @@ func (s *StreamScheduler) RunSchedule() error {
 		return fmt.Errorf("no items to schedule")
 	}
 
+	// Create and start the main pipeline
 	err := s.createMainPipeline()
 	if err != nil {
 		return fmt.Errorf("failed to create main pipeline: %v", err)
 	}
 
-	// Set pipeline to paused state for preroll
-	s.pipeline.SetState(gst.StatePaused)
+	s.mainPipeline.SetState(gst.StatePlaying)
 
-	// Process each item in the schedule
-	for i, item := range items {
-		fmt.Printf("[%s] Processing item %d: %s\n",
-			time.Now().Format("15:04:05.000"), i, item.Source)
+	// Start playing items
+	s.currentIndex = 0
+	s.playCurrentItem(items)
 
-		// Create bin for current item
-		nextBin, err := s.createInputBin(item, i)
-		if err != nil {
-			fmt.Printf("Failed to create bin for item %d: %v\n", i, err)
-			continue
-		}
+	// Main loop to handle item switching
+	go func() {
+		for s.running {
+			select {
+			case <-s.switchNext:
+				s.currentIndex++
+				if s.currentIndex >= len(items) {
+					s.currentIndex = 0 // Loop back to the beginning
+				}
+				s.playCurrentItem(items)
 
-		s.nextBin = nextBin
-
-		// Switch to the newly created bin
-		err = s.switchBin()
-		if err != nil {
-			fmt.Printf("Failed to switch to bin for item %d: %v\n", i, err)
-			continue
-		}
-
-		// Set pipeline to playing state
-		err = s.pipeline.SetState(gst.StatePlaying)
-		if err != nil {
-			fmt.Printf("Failed to set pipeline to playing for item %d: %v\n", i, err)
-			continue
-		}
-
-		// Handle seeking to offset if needed
-		if item.Offset > 0 {
-			go func(offset time.Duration) {
-				// Wait a moment for pipeline to stabilize
-				time.Sleep(200 * time.Millisecond)
-				fmt.Printf("[%s] Seeking to offset %v\n",
-					time.Now().Format("15:04:05.000"), offset)
-
-				// Perform seek operation with appropriate flags
-				ret := s.pipeline.SeekTime(
-					offset,
-					gst.SeekFlagFlush|gst.SeekFlagKeyUnit,
-				)
-				if !ret {
-					fmt.Printf("[%s] Failed to seek to offset\n",
+			case <-time.After(items[s.currentIndex].Duration):
+				// Make sure we don't block if channel is full
+				select {
+				case s.switchNext <- struct{}{}:
+					// Successfully sent signal
+				default:
+					// Channel is full, log and continue
+					fmt.Printf("[%s] Warning: switchNext channel is full, skipping signal\n",
 						time.Now().Format("15:04:05.000"))
-				}
-			}(item.Offset)
-		} else {
-			// Seek to beginning to ensure proper start
-			go func() {
-				time.Sleep(200 * time.Millisecond)
-				ret := s.pipeline.SeekDefault(0.0, gst.SeekFlagFlush|gst.SeekFlagAccurate)
-				if !ret {
-					fmt.Printf("[%s] Failed to seek to beginning\n",
-						time.Now().Format("15:04:05.000"))
-				}
-			}()
-		}
-
-		fmt.Printf("[%s] Item %d: Started playing\n",
-			time.Now().Format("15:04:05.000"), i)
-
-		// Prepare next item in advance if available
-		if i+1 < len(items) {
-			go func(nextItem StreamItem, nextIndex int) {
-				fmt.Printf("[%s] Preparing next item %d in advance\n",
-					time.Now().Format("15:04:05.000"), nextIndex)
-
-				preparedBin, err := s.createInputBin(nextItem, nextIndex)
-				if err != nil {
-					fmt.Printf("Failed to prepare bin for item %d: %v\n", nextIndex, err)
-					return
+					s.currentIndex++
+					if s.currentIndex >= len(items) {
+						s.currentIndex = 0
+					}
+					s.playCurrentItem(items)
 				}
 
-				s.mutex.Lock()
-				s.nextBin = preparedBin
-				s.mutex.Unlock()
-
-				fmt.Printf("[%s] Next item %d prepared successfully\n",
-					time.Now().Format("15:04:05.000"), nextIndex)
-			}(items[i+1], i+1)
+			case <-s.stopChan:
+				s.cleanupPipelines()
+				return
+			}
 		}
-
-		// Handle scheduled breaks
-		if item.NeedBreak {
-			go func(duration time.Duration) {
-				fmt.Printf("[%s] Scheduled break set for %v\n",
-					time.Now().Format("15:04:05.000"), duration)
-				time.Sleep(duration)
-				s.switchNext <- struct{}{}
-			}(item.Duration)
-		}
-
-		// Wait for item to finish or receive control signals
-		select {
-		case <-time.After(item.Duration):
-			fmt.Printf("[%s] Item %d: Duration reached\n",
-				time.Now().Format("15:04:05.000"), i)
-
-		case <-s.switchNext:
-			fmt.Printf("[%s] Item %d: Received switch signal during playback\n",
-				time.Now().Format("15:04:05.000"), i)
-
-		case <-s.stopChan:
-			fmt.Printf("[%s] Item %d: Received stop signal during playback\n",
-				time.Now().Format("15:04:05.000"), i)
-
-			s.pipeline.SetState(gst.StateNull)
-			return nil
-		}
-	}
-
-	s.mutex.Lock()
-	s.running = false
-	s.mutex.Unlock()
-
-	s.pipeline.SetState(gst.StateNull)
+	}()
 
 	return nil
 }
 
 func (s *StreamScheduler) createMainPipeline() error {
-	pipeline, err := gst.NewPipeline("streaming-pipeline")
+	pipeline, err := gst.NewPipeline("main-pipeline")
 	if err != nil {
-		return fmt.Errorf("failed to create pipeline: %v", err)
+		return fmt.Errorf("failed to create main pipeline: %v", err)
 	}
 
-	s.muxer, err = gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
+	// Create two intervideosrc elements for the two input channels
+	intervideo1, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
+		"channel":      "input1",
+		"do-timestamp": true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create intervideosrc1: %v", err)
+	}
+
+	intervideo2, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
+		"channel":      "input2",
+		"do-timestamp": true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create intervideosrc2: %v", err)
+	}
+
+	// Create video mixer (compositor)
+	compositor, err := gst.NewElement("compositor")
+	if err != nil {
+		return fmt.Errorf("failed to create compositor: %v", err)
+	}
+
+	// Create video converter and encoder
+	videoconv, err := gst.NewElement("videoconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create videoconvert: %v", err)
+	}
+
+	h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
+		"tune":    0x00000004, // zerolatency
+		"bitrate": 2000,       // 2 Mbps
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create h264enc: %v", err)
+	}
+
+	// Create audio elements (interaudiosrc, audiomixer, etc.)
+	interaudio1, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
+		"channel":      "audio1",
+		"do-timestamp": true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interaudiosrc1: %v", err)
+	}
+
+	interaudio2, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
+		"channel":      "audio2",
+		"do-timestamp": true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interaudiosrc2: %v", err)
+	}
+
+	audiomixer, err := gst.NewElement("audiomixer")
+	if err != nil {
+		return fmt.Errorf("failed to create audiomixer: %v", err)
+	}
+
+	audioconv, err := gst.NewElement("audioconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create audioconvert: %v", err)
+	}
+
+	aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
+		"bitrate": 128000,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create aacenc: %v", err)
+	}
+
+	// Create muxer and RTP elements
+	mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
 		"alignment":    7,
 		"pat-interval": int64(100 * 1000000),
 		"pmt-interval": int64(100 * 1000000),
 		"pcr-interval": int64(20 * 1000000),
-		"latency":      0,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
-	tee, err := gst.NewElement("tee")
-	if err != nil {
-		return fmt.Errorf("failed to create tee element: %v", err)
-	}
-
-	rtpQueue, err := gst.NewElement("queue")
-	if err != nil {
-		return fmt.Errorf("could not create RTP queue: %v", err)
-	}
-
 	rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
-		"pt":               33,
-		"mtu":              1400,
-		"ssrc":             uint32(0),
-		"timestamp-offset": uint32(0),
-		"perfect-rtptime":  true,
-		"seqnum-offset":    uint32(0),
+		"pt":              33,
+		"mtu":             1400,
+		"perfect-rtptime": true,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
 
-	rtpJitterBuffer, err := gst.NewElementWithProperties("rtpjitterbuffer", map[string]interface{}{
-		"latency":         100,
-		"drop-on-latency": true,
-		"do-lost":         true,
+	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
+		"host":           s.host,
+		"port":           s.port,
+		"sync":           true,
+		"buffer-size":    524288,
+		"auto-multicast": true,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create rtpjitterbuffer: %v", err)
+		return fmt.Errorf("failed to create udpsink: %v", err)
 	}
 
-	sinkProps := map[string]interface{}{
-		"host":         s.host,
-		"port":         s.port,
-		"max-lateness": -1,
-		"ts-offset":    0,
-		"sync":         true,
-		"async":        false,
-		"buffer-size":  1048576,
-	}
-
-	isMulticast := net.ParseIP(s.host).IsMulticast()
-	if isMulticast {
-		sinkProps["auto-multicast"] = true
-		sinkProps["ttl"] = 64
-
-		fmt.Printf("Multicast stream detected, using default interface\n")
-	}
-
-	udpsink, err := gst.NewElementWithProperties("udpsink", sinkProps)
+	// Add queues to manage latency in the main pipeline
+	videoQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
 	if err != nil {
-		return fmt.Errorf("could not create udpsink: %v", err)
+		return fmt.Errorf("failed to create videoQueue1: %v", err)
 	}
 
-	debugEnabled := false
-	var debugQueue *gst.Element
-	var debugFileSink *gst.Element
-
-	pipeline.AddMany(tee, s.muxer, rtpQueue, rtpmp2tpay, rtpJitterBuffer, udpsink)
-
-	if debugEnabled {
-		pipeline.AddMany(debugQueue, debugFileSink)
+	videoQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create videoQueue2: %v", err)
 	}
 
-	s.muxer.Link(tee)
-
-	teeSrcPad := tee.GetRequestPad("src_%u")
-	if teeSrcPad == nil {
-		return fmt.Errorf("failed to get request pad from tee")
+	audioQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioQueue1: %v", err)
 	}
 
-	rtpQueueSinkPad := rtpQueue.GetStaticPad("sink")
-	if rtpQueueSinkPad == nil {
-		return fmt.Errorf("failed to get sink pad from rtpQueue")
+	audioQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioQueue2: %v", err)
 	}
 
-	if teeSrcPad.Link(rtpQueueSinkPad) != gst.PadLinkOK {
-		return fmt.Errorf("failed to link tee to rtpQueue")
+	// Add queues after mixer/compositor
+	videoMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create videoMixerQueue: %v", err)
 	}
 
-	rtpQueue.Link(rtpmp2tpay)
-	rtpmp2tpay.Link(rtpJitterBuffer)
-	rtpJitterBuffer.Link(udpsink)
+	audioMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioMixerQueue: %v", err)
+	}
 
+	// Add final queue before muxer
+	muxerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   200,
+		"max-size-time":      uint64(1 * time.Second),
+		"min-threshold-time": uint64(100 * time.Millisecond),
+		"leaky":              0, // No leaking
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create muxerQueue: %v", err)
+	}
+
+	// Create audio converter elements for each input
+	audioconv1, err := gst.NewElement("audioconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create audioconv1: %v", err)
+	}
+
+	audioconv2, err := gst.NewElement("audioconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create audioconv2: %v", err)
+	}
+
+	// Create audioresample elements to ensure rate compatibility
+	audioresample1, err := gst.NewElement("audioresample")
+	if err != nil {
+		return fmt.Errorf("failed to create audioresample1: %v", err)
+	}
+
+	audioresample2, err := gst.NewElement("audioresample")
+	if err != nil {
+		return fmt.Errorf("failed to create audioresample2: %v", err)
+	}
+
+	// Create capsfilters to explicitly set audio format
+	audiocaps1, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audiocaps1: %v", err)
+	}
+
+	audiocaps2, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audiocaps2: %v", err)
+	}
+
+	// Add all new elements to the pipeline
+	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
+
+	// Add all elements to the pipeline
+	pipeline.AddMany(intervideo1, intervideo2, compositor, videoconv, h264enc)
+	pipeline.AddMany(interaudio1, interaudio2, audiomixer, audioconv, aacenc)
+	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
+	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
+	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
+
+	// Link video elements
+	intervideo1.Link(videoQueue1)
+	videoQueue1.Link(compositor)
+	intervideo2.Link(videoQueue2)
+	videoQueue2.Link(compositor)
+	compositor.Link(videoMixerQueue)
+	videoMixerQueue.Link(videoconv)
+	videoconv.Link(h264enc)
+	h264enc.Link(muxerQueue)
+	muxerQueue.Link(mpegtsmux)
+
+	// Link audio elements
+	interaudio1.Link(audioQueue1)
+	audioQueue1.Link(audioconv1)
+	audioconv1.Link(audioresample1)
+	audioresample1.Link(audiocaps1)
+	audiocaps1.Link(audiomixer)
+
+	interaudio2.Link(audioQueue2)
+	audioQueue2.Link(audioconv2)
+	audioconv2.Link(audioresample2)
+	audioresample2.Link(audiocaps2)
+	audiocaps2.Link(audiomixer)
+
+	audiomixer.Link(audioMixerQueue)
+	audioMixerQueue.Link(audioconv)
+	audioconv.Link(aacenc)
+	aacenc.Link(mpegtsmux)
+
+	// Link muxer to RTP and UDP sink
+	mpegtsmux.Link(rtpmp2tpay)
+	rtpmp2tpay.Link(udpsink)
+
+	// Set up bus watch
 	bus := pipeline.GetBus()
 	go func() {
 		for {
@@ -315,278 +395,223 @@ func (s *StreamScheduler) createMainPipeline() error {
 			case gst.MessageError:
 				gerr := msg.ParseError()
 				fmt.Printf("Error from element %s: %s\n", msg.Source(), gerr.Error())
-
 			case gst.MessageWarning:
 				gerr := msg.ParseWarning()
 				fmt.Printf("Warning from element %s: %s\n", msg.Source(), gerr.Error())
 			case gst.MessageEOS:
-				fmt.Printf("[%s] End of stream received from %s - ignoring to continue playback\n",
-					time.Now().Format("15:04:05.000"), msg.Source())
+				fmt.Printf("End of stream received\n")
 			}
 		}
 	}()
 
-	fmt.Println("Setting pipeline to PAUSED state for preroll...")
-
-	pipeline.SetState(gst.StatePaused)
-
-	fmt.Printf("[%s] Pipeline for item %d prerolled successfully\n",
-		time.Now().Format("15:04:05.000"), 0)
-
-	s.pipeline = pipeline
+	s.mainPipeline = pipeline
 	return nil
 }
 
-func (s *StreamScheduler) createInputBin(item StreamItem, index int) (*Bin, error) {
-	fmt.Printf("[%s] Preparing pipeline for item %d: %s\n",
-		time.Now().Format("15:04:05.000"), index, item.Source)
+func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, channel string) (*gst.Pipeline, error) {
+	pipelineName := fmt.Sprintf("source-pipeline-%d", index)
+	pipeline, err := gst.NewPipeline(pipelineName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create source pipeline: %v", err)
+	}
 
-	// Create a unique bin name with timestamp to avoid conflicts
-	binName := fmt.Sprintf("input-bin-%d-%d", index, time.Now().UnixNano())
-	bin := gst.NewBin(binName)
-
-	// Create file source element
-	filesrc, err := gst.NewElementWithProperties("filesrc", map[string]interface{}{
-		"location": item.Source,
+	// Create playbin for easy media handling
+	playbin, err := gst.NewElementWithProperties("playbin3", map[string]interface{}{
+		"uri": fmt.Sprintf("file://%s", item.Source),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create filesrc: %v", err)
+		return nil, fmt.Errorf("failed to create playbin: %v", err)
 	}
 
-	// Create decodebin for handling various formats
-	decodebin, err := gst.NewElement("decodebin")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create decodebin: %v", err)
-	}
+	// Add buffering properties to playbin
+	playbin.SetProperty("buffer-size", 10485760) // 10MB buffer
+	playbin.SetProperty("buffer-duration", uint64(5*time.Second))
+	playbin.SetProperty("low-percent", 10)
+	playbin.SetProperty("high-percent", 99)
+	playbin.SetProperty("use-buffering", true)
 
-	// Create video processing elements
-	videoQueue, err := gst.NewElement("queue")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create video queue: %v", err)
-	}
-
-	videoIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
-		"sync": true,
+	// Create video sink
+	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
+		"channel": channel,
+		"sync":    true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create video identity: %v", err)
+		return nil, fmt.Errorf("failed to create intervideosink: %v", err)
 	}
 
-	videoConvert, err := gst.NewElement("videoconvert")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create videoconvert: %v", err)
-	}
+	// Add latency control to the video sink
+	intervideosink.SetProperty("max-lateness", int64(20*time.Millisecond))
+	intervideosink.SetProperty("qos", true)
 
-	videoEncoder, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
-		"tune":    0x00000004, // zerolatency
-		"bitrate": 2000,       // 2 Mbps
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create h264enc: %v", err)
-	}
+	// Set video sink on playbin
+	playbin.SetProperty("video-sink", intervideosink)
 
-	videoCaps := gst.NewCapsFromString("video/x-h264,profile=baseline")
-	videoCapsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": videoCaps,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create video caps filter: %v", err)
-	}
+	// Create audio bin with format conversion
+	audiobin := gst.NewBin("audiobin")
 
-	// Create audio processing elements
-	audioQueue, err := gst.NewElement("queue")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create audioQueue: %v", err)
-	}
-
-	audioIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
-		"sync": true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create audio identity: %v", err)
-	}
-
-	audioConvert, err := gst.NewElement("audioconvert")
+	// Create elements for audio conversion
+	audioconvert, err := gst.NewElement("audioconvert")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
-	audioResample, err := gst.NewElement("audioresample")
+	audioresample, err := gst.NewElement("audioresample")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioresample: %v", err)
 	}
 
-	audioEncoder, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
-		"bitrate": 128000,
+	audiocaps, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create aacenc: %v", err)
+		return nil, fmt.Errorf("failed to create audiocaps: %v", err)
 	}
 
-	audioCaps := gst.NewCapsFromString("audio/x-raw,rate=44100,channels=2")
-	audioCapsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": audioCaps,
+	// Create audio sink with proper format
+	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
+		"channel": fmt.Sprintf("audio%s", channel[len(channel)-1:]),
+		"sync":    true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create audio caps filter: %v", err)
+		return nil, fmt.Errorf("failed to create interaudiosink: %v", err)
 	}
 
-	// Add all elements to bin
-	err = bin.AddMany(filesrc, decodebin)
-	if err != nil {
-		return nil, fmt.Errorf("error adding file and decode bin: %v", err)
+	// Add elements to bin
+	audiobin.AddMany(audioconvert, audioresample, audiocaps, interaudiosink)
+
+	// Link elements in bin
+	audioconvert.Link(audioresample)
+	audioresample.Link(audiocaps)
+	audiocaps.Link(interaudiosink)
+
+	// Create and add ghost pad using the bin's method
+	sinkpad := audioconvert.GetStaticPad("sink")
+	if sinkpad == nil {
+		return nil, fmt.Errorf("failed to get sink pad from audioconvert")
 	}
 
-	err = bin.AddMany(videoQueue, videoIdentity, videoConvert, videoEncoder, videoCapsFilter)
-	if err != nil {
-		return nil, fmt.Errorf("error adding video elements: %v", err)
+	ghostpad := gst.NewGhostPad("sink", sinkpad)
+	if ghostpad == nil {
+		return nil, fmt.Errorf("failed to create ghost pad")
 	}
 
-	err = bin.AddMany(audioQueue, audioIdentity, audioConvert, audioResample, audioCapsFilter, audioEncoder)
-	if err != nil {
-		return nil, fmt.Errorf("error adding audio elements: %v", err)
+	if !audiobin.AddPad(ghostpad.Pad) {
+		return nil, fmt.Errorf("failed to add ghost pad to bin")
 	}
 
-	// Link source to decodebin
-	err = filesrc.Link(decodebin)
-	if err != nil {
-		return nil, fmt.Errorf("error linking filesrc -> decodebin: %v", err)
-	}
+	// Set audio-sink property on playbin to use our bin
+	playbin.SetProperty("audio-sink", audiobin)
 
-	// Connect to pad-added signal to handle dynamic pad creation
-	_, err = decodebin.Connect("pad-added", func(db *gst.Element, pad *gst.Pad) {
-		caps := pad.GetCurrentCaps()
-		if caps == nil {
-			return
-		}
-		mediaType := caps.GetStructureAt(0).Name()
-		if mediaType[:5] == "video" {
-			// Link video elements in sequence
-			err = gst.ElementLinkMany(videoQueue, videoIdentity, videoConvert, videoEncoder, videoCapsFilter, s.muxer)
-			if err != nil {
-				fmt.Printf("Error linking video elements: %v\n", err)
-				return
-			}
-			sinkPad := videoQueue.GetStaticPad("sink")
-			if sinkPad == nil {
-				fmt.Printf("Error: couldn't get sink pad from videoQueue\n")
-				return
-			}
-			if pad.Link(sinkPad) != gst.PadLinkOK {
-				fmt.Printf("Error: couldn't link video pad\n")
-				return
-			}
-			fmt.Printf("Linked video pad successfully\n")
-		} else if mediaType[:5] == "audio" {
-			// Link audio elements in sequence
-			err = gst.ElementLinkMany(audioQueue, audioIdentity, audioConvert, audioResample, audioCapsFilter, audioEncoder, s.muxer)
-			if err != nil {
-				fmt.Printf("Error linking audio elements: %v\n", err)
-				return
-			}
-			sinkPad := audioQueue.GetStaticPad("sink")
-			if sinkPad == nil {
-				fmt.Printf("Error: couldn't get sink pad from audioQueue\n")
-				return
-			}
-			if pad.Link(sinkPad) != gst.PadLinkOK {
-				fmt.Printf("Error: couldn't link audio pad\n")
-				return
-			}
-			fmt.Printf("Linked audio pad successfully\n")
-		}
-	})
+	// Add playbin to pipeline
+	pipeline.Add(playbin)
 
-	if err != nil {
-		return nil, fmt.Errorf("error connecting decodebin: %v", err)
-	}
-
-	return &Bin{
-		Bin:        bin,
-		VideoQueue: videoQueue,
-		AudioQueue: audioQueue,
-		Item:       item,
-	}, nil
-}
-
-func (s *StreamScheduler) switchBin() error {
-	if s.nextBin == nil {
-		return fmt.Errorf("no next bin available to switch to")
-	}
-
-	fmt.Printf("[%s] Switching to bin for item: %s\n",
-		time.Now().Format("15:04:05.000"), s.nextBin.Item.Source)
-
-	// If we have a current bin, properly clean it up
-	if s.currentBin != nil {
-		fmt.Printf("[%s] Cleaning up current bin\n", time.Now().Format("15:04:05.000"))
-
-		// Send EOS to both video and audio queues
-		eos := gst.NewEOSEvent()
-		if s.currentBin.VideoQueue != nil {
-			pad := s.currentBin.VideoQueue.GetStaticPad("sink")
-			if pad != nil {
-				pad.SendEvent(eos)
-			}
-		}
-		if s.currentBin.AudioQueue != nil {
-			pad := s.currentBin.AudioQueue.GetStaticPad("sink")
-			if pad != nil {
-				pad.SendEvent(eos)
-			}
-		}
-
-		// Wait for EOS message on the bus
-		bus := s.pipeline.GetBus()
+	// Set up bus watch
+	bus := pipeline.GetBus()
+	go func() {
 		for {
-			msg := bus.TimedPopFiltered(gst.ClockTime(2*time.Second), gst.MessageEOS)
-			if msg != nil && msg.Type() == gst.MessageEOS {
+			msg := bus.TimedPop(gst.ClockTimeNone)
+			if msg == nil {
 				break
 			}
-		}
 
-		// FLUSH the muxer to clear any buffered data
-		muxerPad := s.muxer.GetStaticPad("sink")
-		if muxerPad != nil {
-			muxerPad.SendEvent(gst.NewFlushStartEvent())
-			muxerPad.SendEvent(gst.NewFlushStopEvent(false))
+			switch msg.Type() {
+			case gst.MessageError:
+				gerr := msg.ParseError()
+				fmt.Printf("[%s] Error from source %d: %s\n",
+					time.Now().Format("15:04:05.000"), index, gerr.Error())
+				// Try to recover by scheduling the next item
+				s.switchNext <- struct{}{}
+			case gst.MessageEOS:
+				fmt.Printf("[%s] End of stream for source %d\n",
+					time.Now().Format("15:04:05.000"), index)
+				s.switchNext <- struct{}{}
+			case gst.MessageStateChanged:
+				if msg.Source() == pipeline.Element.GetName() {
+					oldState, newState := msg.ParseStateChanged()
+					if oldState == gst.StatePaused && newState == gst.StatePlaying {
+						fmt.Printf("[%s] Pipeline %d state changed to PLAYING\n",
+							time.Now().Format("15:04:05.000"), index)
+					}
+				}
+			}
 		}
+	}()
 
-		// Set state to NULL to release resources
-		err := s.currentBin.Bin.SetState(gst.StateNull)
-		if err != nil {
-			fmt.Printf("Warning: error setting current bin state to null: %v\n", err)
-		}
+	return pipeline, nil
+}
 
-		// Remove from pipeline
-		err = s.pipeline.Remove(s.currentBin.Bin.Element)
-		if err != nil {
-			fmt.Printf("Warning: error removing current bin: %v\n", err)
-		}
+func (s *StreamScheduler) playCurrentItem(items []StreamItem) {
+	fmt.Printf("[%s] Preparing to play item %d: %s\n",
+		time.Now().Format("15:04:05.000"), s.currentIndex, items[s.currentIndex].Source)
+
+	// Clean up any existing source pipelines
+	for _, pipeline := range s.sourcePipelines {
+		pipeline.SetState(gst.StateNull)
 	}
+	s.sourcePipelines = nil
 
-	// Switch to the next bin
-	s.currentBin = s.nextBin
-	s.nextBin = nil
+	// Determine which channel to use (alternating between 1 and 2)
+	channel := fmt.Sprintf("input%d", (s.currentIndex%2)+1)
 
-	fmt.Printf("[%s] Adding new bin to pipeline\n", time.Now().Format("15:04:05.000"))
-
-	// Add the new bin to the pipeline
-	err := s.pipeline.Add(s.currentBin.Bin.Element)
+	// Create new source pipeline
+	pipeline, err := s.createSourcePipeline(items[s.currentIndex], s.currentIndex, channel)
 	if err != nil {
-		return fmt.Errorf("error adding bin to pipeline: %v", err)
+		fmt.Printf("[%s] Error creating source pipeline: %v\n",
+			time.Now().Format("15:04:05.000"), err)
+		// Try to recover by scheduling the next item
+		time.AfterFunc(1*time.Second, func() {
+			s.switchNext <- struct{}{}
+		})
+		return
 	}
 
-	// Set the bin state to playing
-	err = s.currentBin.Bin.SetState(gst.StatePlaying)
-	if err != nil {
-		return fmt.Errorf("error setting bin state to playing: %v", err)
+	s.sourcePipelines = append(s.sourcePipelines, pipeline)
+
+	// Start playing
+	err1 := pipeline.SetState(gst.StatePlaying)
+	if err1 != nil {
+		fmt.Printf("[%s] Failed to set pipeline to playing state:\n",
+			time.Now().Format("15:04:05.000"))
+		// Try to recover by scheduling the next item
+		time.AfterFunc(1*time.Second, func() {
+			s.switchNext <- struct{}{}
+		})
+		return
 	}
 
-	fmt.Printf("[%s] Successfully switched to bin for item: %s\n",
-		time.Now().Format("15:04:05.000"), s.currentBin.Item.Source)
+	fmt.Printf("[%s] Started playing item %d: %s on channel %s\n",
+		time.Now().Format("15:04:05.000"), s.currentIndex, items[s.currentIndex].Source, channel)
 
-	return nil
+	// Handle seeking to offset if needed
+	if items[s.currentIndex].Offset > 0 {
+		go func(offset time.Duration) {
+			// Wait a moment for pipeline to stabilize
+			time.Sleep(200 * time.Millisecond)
+			fmt.Printf("[%s] Seeking to offset %v\n",
+				time.Now().Format("15:04:05.000"), offset)
+
+			// Perform seek operation
+			ret := pipeline.SeekTime(
+				offset,
+				gst.SeekFlagFlush|gst.SeekFlagKeyUnit,
+			)
+			if !ret {
+				fmt.Printf("[%s] Failed to seek to offset\n",
+					time.Now().Format("15:04:05.000"))
+			}
+		}(items[s.currentIndex].Offset)
+	}
+}
+
+func (s *StreamScheduler) cleanupPipelines() {
+	// Stop all pipelines
+	if s.mainPipeline != nil {
+		s.mainPipeline.SetState(gst.StateNull)
+	}
+
+	for _, pipeline := range s.sourcePipelines {
+		pipeline.SetState(gst.StateNull)
+	}
 }
 
 func (s *StreamScheduler) Stop() {
@@ -599,9 +624,5 @@ func (s *StreamScheduler) Stop() {
 
 	close(s.stopChan)
 	s.running = false
-
-	if s.pipeline != nil {
-		s.pipeline.SetState(gst.StateNull)
-		s.pipeline = nil
-	}
+	s.cleanupPipelines()
 }
