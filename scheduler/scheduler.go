@@ -150,6 +150,23 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create intervideosrc2: %v", err)
 	}
 
+	// Create identity elements with sync=true to ensure proper timing
+	identity1, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "identity1" + s.schedulerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create identity1: %v", err)
+	}
+
+	identity2, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "identity2" + s.schedulerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create identity2: %v", err)
+	}
+
 	// Create video mixer (compositor)
 	s.compositor, err = gst.NewElementWithProperties("compositor", map[string]interface{}{
 		"background":            1, // black background
@@ -160,24 +177,28 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create compositor: %v", err)
 	}
 
-	// Configure compositor sink pads for proper positioning
-	pad1 := s.compositor.GetStaticPad("sink_0")
-	if pad1 != nil {
-		pad1.SetProperty("xpos", 0)
-		pad1.SetProperty("ypos", 0)
-		pad1.SetProperty("width", 1920)
-		pad1.SetProperty("height", 1080)
-		pad1.SetProperty("alpha", 1.0) // input1 visible
-	}
+	// We'll configure the pads when they're actually created
+	// The compositor creates pads dynamically when elements are linked to it
+	// We'll set up a pad-added signal handler to configure pads as they're created
+	s.compositor.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
+		padName := pad.GetName()
+		fmt.Printf("[%s] Compositor pad added: %s\n", time.Now().Format("15:04:05.000"), padName)
 
-	pad2 := s.compositor.GetStaticPad("sink_1")
-	if pad2 != nil {
-		pad2.SetProperty("xpos", 0)
-		pad2.SetProperty("ypos", 0)
-		pad2.SetProperty("width", 1920)
-		pad2.SetProperty("height", 1080)
-		pad2.SetProperty("alpha", 0.0) // input2 hidden
-	}
+		// Configure the pad based on its name
+		if padName == "sink_0" {
+			pad.SetProperty("xpos", 0)
+			pad.SetProperty("ypos", 0)
+			pad.SetProperty("width", 1920)
+			pad.SetProperty("height", 1080)
+			pad.SetProperty("alpha", 1.0) // Initially show input1
+		} else if padName == "sink_1" {
+			pad.SetProperty("xpos", 0)
+			pad.SetProperty("ypos", 0)
+			pad.SetProperty("width", 1920)
+			pad.SetProperty("height", 1080)
+			pad.SetProperty("alpha", 0.0) // Initially hide input2
+		}
+	})
 
 	// Create video converter and encoder
 	videoconv, err := gst.NewElement("videoconvert")
@@ -213,14 +234,31 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create interaudiosrc2: %v", err)
 	}
 
+	// Create identity elements for audio with sync=true to ensure proper timing
+	audioIdentity1, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "audioIdentity1" + s.schedulerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioIdentity1: %v", err)
+	}
+
+	audioIdentity2, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "audioIdentity2" + s.schedulerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioIdentity2: %v", err)
+	}
+
 	audiomixer, err := gst.NewElement("audiomixer")
-	audiomixer.SetProperty("name", "audiomixer" + s.schedulerID)
+	audiomixer.SetProperty("name", "audiomixer"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audiomixer: %v", err)
 	}
 
 	audioconv, err := gst.NewElement("audioconvert")
-	audioconv.SetProperty("name", "audioconv" + s.schedulerID)
+	audioconv.SetProperty("name", "audioconv"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconvert: %v", err)
 	}
@@ -249,7 +287,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"pt":              33,
 		"mtu":             1400,
 		"perfect-rtptime": true,
-		"name":           "rtpmp2tpay" + s.schedulerID,
+		"name":            "rtpmp2tpay" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
@@ -349,26 +387,26 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	// Create audio converter elements for each input
 	audioconv1, err := gst.NewElement("audioconvert")
-	audioconv1.SetProperty("name", "audioconv1" + s.schedulerID)
+	audioconv1.SetProperty("name", "audioconv1"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconv1: %v", err)
 	}
 
 	audioconv2, err := gst.NewElement("audioconvert")
-	audioconv2.SetProperty("name", "audioconv2" + s.schedulerID)
+	audioconv2.SetProperty("name", "audioconv2"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconv2: %v", err)
 	}
 
 	// Create audioresample elements to ensure rate compatibility
 	audioresample1, err := gst.NewElement("audioresample")
-	audioresample1.SetProperty("name", "audioresample1" + s.schedulerID)
+	audioresample1.SetProperty("name", "audioresample1"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioresample1: %v", err)
 	}
 
 	audioresample2, err := gst.NewElement("audioresample")
-	audioresample2.SetProperty("name", "audioresample2" + s.schedulerID)
+	audioresample2.SetProperty("name", "audioresample2"+s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioresample2: %v", err)
 	}
@@ -394,16 +432,18 @@ func (s *StreamScheduler) createMainPipeline() error {
 	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
 
 	// Add all elements to the pipeline
-	pipeline.AddMany(intervideo1, intervideo2, s.compositor, videoconv, h264enc)
-	pipeline.AddMany(interaudio1, interaudio2, audiomixer, audioconv, aacenc)
+	pipeline.AddMany(intervideo1, intervideo2, identity1, identity2, s.compositor, videoconv, h264enc)
+	pipeline.AddMany(interaudio1, interaudio2, audioIdentity1, audioIdentity2, audiomixer, audioconv, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
 	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
 	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
 
 	// Link video elements
-	intervideo1.Link(videoQueue1)
+	intervideo1.Link(identity1)
+	identity1.Link(videoQueue1)
 	videoQueue1.Link(s.compositor)
-	intervideo2.Link(videoQueue2)
+	intervideo2.Link(identity2)
+	identity2.Link(videoQueue2)
 	videoQueue2.Link(s.compositor)
 	s.compositor.Link(videoMixerQueue)
 	videoMixerQueue.Link(videoconv)
@@ -412,13 +452,15 @@ func (s *StreamScheduler) createMainPipeline() error {
 	muxerQueue.Link(mpegtsmux)
 
 	// Link audio elements
-	interaudio1.Link(audioQueue1)
+	interaudio1.Link(audioIdentity1)
+	audioIdentity1.Link(audioQueue1)
 	audioQueue1.Link(audioconv1)
 	audioconv1.Link(audioresample1)
 	audioresample1.Link(audiocaps1)
 	audiocaps1.Link(audiomixer)
 
-	interaudio2.Link(audioQueue2)
+	interaudio2.Link(audioIdentity2)
+	audioIdentity2.Link(audioQueue2)
 	audioQueue2.Link(audioconv2)
 	audioconv2.Link(audioresample2)
 	audioresample2.Link(audiocaps2)
@@ -481,6 +523,18 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 	playbin.SetProperty("high-percent", 99)
 	playbin.SetProperty("use-buffering", true)
 
+	// Create video sink with identity element for sync
+	videobin := gst.NewBin("videobin")
+
+	// Create identity element for video sync
+	videoIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "videoIdentity" + s.schedulerID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create videoIdentity: %v", err)
+	}
+
 	// Create video sink
 	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
 		"channel": channel + s.schedulerID,
@@ -494,8 +548,29 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 	intervideosink.SetProperty("max-lateness", int64(20*time.Millisecond))
 	intervideosink.SetProperty("qos", true)
 
+	// Add elements to video bin
+	videobin.AddMany(videoIdentity, intervideosink)
+
+	// Link elements in video bin
+	videoIdentity.Link(intervideosink)
+
+	// Create and add ghost pad
+	sinkpad := videoIdentity.GetStaticPad("sink")
+	if sinkpad == nil {
+		return nil, fmt.Errorf("failed to get sink pad from videoIdentity")
+	}
+
+	ghostpad := gst.NewGhostPad("sink", sinkpad)
+	if ghostpad == nil {
+		return nil, fmt.Errorf("failed to create ghost pad for video bin")
+	}
+
+	if !videobin.AddPad(ghostpad.Pad) {
+		return nil, fmt.Errorf("failed to add ghost pad to video bin")
+	}
+
 	// Set video sink on playbin
-	playbin.SetProperty("video-sink", intervideosink)
+	playbin.SetProperty("video-sink", videobin)
 
 	// Create audio bin with format conversion
 	audiobin := gst.NewBin("audiobin")
@@ -519,6 +594,15 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 		return nil, fmt.Errorf("failed to create audiocaps: %v", err)
 	}
 
+	// Create identity element for audio sync
+	audioSourceIdentity, err := gst.NewElementWithProperties("identity", map[string]interface{}{
+		"sync": true,
+		"name": "audioSourceIdentity" + s.schedulerID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create audioSourceIdentity: %v", err)
+	}
+
 	// Create audio sink with proper format
 	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
 		"channel": fmt.Sprintf("audio%s", channel[len(channel)-1:]) + s.schedulerID,
@@ -530,25 +614,26 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 	}
 
 	// Add elements to bin
-	audiobin.AddMany(audioconvert, audioresample, audiocaps, interaudiosink)
+	audiobin.AddMany(audioconvert, audioresample, audiocaps, audioSourceIdentity, interaudiosink)
 
 	// Link elements in bin
 	audioconvert.Link(audioresample)
 	audioresample.Link(audiocaps)
-	audiocaps.Link(interaudiosink)
+	audiocaps.Link(audioSourceIdentity)
+	audioSourceIdentity.Link(interaudiosink)
 
 	// Create and add ghost pad using the bin's method
-	sinkpad := audioconvert.GetStaticPad("sink")
-	if sinkpad == nil {
+	audioSinkpad := audioconvert.GetStaticPad("sink")
+	if audioSinkpad == nil {
 		return nil, fmt.Errorf("failed to get sink pad from audioconvert")
 	}
 
-	ghostpad := gst.NewGhostPad("sink", sinkpad)
-	if ghostpad == nil {
+	audioGhostpad := gst.NewGhostPad("sink", audioSinkpad)
+	if audioGhostpad == nil {
 		return nil, fmt.Errorf("failed to create ghost pad")
 	}
 
-	if !audiobin.AddPad(ghostpad.Pad) {
+	if !audiobin.AddPad(audioGhostpad.Pad) {
 		return nil, fmt.Errorf("failed to add ghost pad to bin")
 	}
 
@@ -656,23 +741,52 @@ func (s *StreamScheduler) playCurrentItem(items []StreamItem) {
 	}
 
 	// Toggle visibility based on current channel
-	if channel == "input1" + s.schedulerID {
+	// Wait a moment for the pipeline to stabilize and pads to be created
+	go func(ch string) {
+		// Give the pipeline a moment to create and configure pads
+		time.Sleep(500 * time.Millisecond)
 
-		pad1 := s.compositor.GetStaticPad("sink_0")
-		pad2 := s.compositor.GetStaticPad("sink_1")
-		if pad1 != nil && pad2 != nil {
-			pad1.SetProperty("alpha", 1.0) // Show input1
-			pad2.SetProperty("alpha", 0.0) // Hide input2
-		}
-	} else {
+		fmt.Printf("[%s] Setting visibility for channel %s\n",
+			time.Now().Format("15:04:05.000"), ch)
 
-		pad1 := s.compositor.GetStaticPad("sink_0")
-		pad2 := s.compositor.GetStaticPad("sink_1")
-		if pad1 != nil && pad2 != nil {
-			pad1.SetProperty("alpha", 0.0) // Hide input1
-			pad2.SetProperty("alpha", 1.0) // Show input2
+		// The channel name is just "input1" or "input2" without the schedulerID
+		// We need to check if it's input1 or input2 to determine which pad to show
+		if ch == "input1" {
+			// For input1, we need to show sink_0 and hide sink_1
+			pad1 := s.compositor.GetStaticPad("sink_0")
+			pad2 := s.compositor.GetStaticPad("sink_1")
+
+			if pad1 != nil {
+				fmt.Printf("[%s] Setting sink_0 alpha to 1.0\n", time.Now().Format("15:04:05.000"))
+				pad1.SetProperty("alpha", 1.0) // Show input1
+			} else {
+				fmt.Printf("[%s] Warning: sink_0 pad is nil\n", time.Now().Format("15:04:05.000"))
+			}
+
+			if pad2 != nil {
+				fmt.Printf("[%s] Setting sink_1 alpha to 0.0\n", time.Now().Format("15:04:05.000"))
+				pad2.SetProperty("alpha", 0.0) // Hide input2
+			}
+		} else if ch == "input2" {
+			// For input2, we need to show sink_1 and hide sink_0
+			pad1 := s.compositor.GetStaticPad("sink_0")
+			pad2 := s.compositor.GetStaticPad("sink_1")
+
+			if pad1 != nil {
+				fmt.Printf("[%s] Setting sink_0 alpha to 0.0\n", time.Now().Format("15:04:05.000"))
+				pad1.SetProperty("alpha", 0.0) // Hide input1
+			}
+
+			if pad2 != nil {
+				fmt.Printf("[%s] Setting sink_1 alpha to 1.0\n", time.Now().Format("15:04:05.000"))
+				pad2.SetProperty("alpha", 1.0) // Show input2
+			} else {
+				fmt.Printf("[%s] Warning: sink_1 pad is nil\n", time.Now().Format("15:04:05.000"))
+			}
+		} else {
+			fmt.Printf("[%s] Unknown channel: %s\n", time.Now().Format("15:04:05.000"), ch)
 		}
-	}
+	}(channel)
 }
 
 func (s *StreamScheduler) cleanupPipelines() {
