@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-gst/go-gst/gst"
+	"github.com/google/uuid"
 )
 
 type StreamItem struct {
@@ -37,17 +38,19 @@ type StreamScheduler struct {
 	switchNext      chan struct{}
 	running         bool
 	currentIndex    int
+	schedulerID     string
 }
 
 func NewStreamScheduler(host string, port int) (*StreamScheduler, error) {
 	gst.Init(nil)
 
 	return &StreamScheduler{
-		host:       host,
-		port:       port,
-		items:      make([]StreamItem, 0),
-		stopChan:   make(chan struct{}),
-		switchNext: make(chan struct{}, 5), // Buffered channel to prevent blocking
+		host:        host,
+		port:        port,
+		items:       make([]StreamItem, 0),
+		stopChan:    make(chan struct{}),
+		switchNext:  make(chan struct{}, 5), // Buffered channel to prevent blocking
+		schedulerID: uuid.New().String(),
 	}, nil
 }
 
@@ -123,23 +126,25 @@ func (s *StreamScheduler) RunSchedule() error {
 }
 
 func (s *StreamScheduler) createMainPipeline() error {
-	pipeline, err := gst.NewPipeline("main-pipeline")
+	pipeline, err := gst.NewPipeline("main-pipeline" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create main pipeline: %v", err)
 	}
 
 	// Create two intervideosrc elements for the two input channels
 	intervideo1, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
-		"channel":      "input1",
+		"channel":      "input1" + s.schedulerID,
 		"do-timestamp": true,
+		"name":         "intervideosrc1" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create intervideosrc1: %v", err)
 	}
 
 	intervideo2, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
-		"channel":      "input2",
+		"channel":      "input2" + s.schedulerID,
 		"do-timestamp": true,
+		"name":         "intervideosrc2" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create intervideosrc2: %v", err)
@@ -149,6 +154,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	s.compositor, err = gst.NewElementWithProperties("compositor", map[string]interface{}{
 		"background":            1, // black background
 		"zero-size-is-unscaled": true,
+		"name":                  "compositor" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create compositor: %v", err)
@@ -182,6 +188,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"tune":    0x00000004, // zerolatency
 		"bitrate": 2000,       // 2 Mbps
+		"name":    "h264enc" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create h264enc: %v", err)
@@ -189,33 +196,38 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	// Create audio elements (interaudiosrc, audiomixer, etc.)
 	interaudio1, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
-		"channel":      "audio1",
+		"channel":      "audio1" + s.schedulerID,
 		"do-timestamp": true,
+		"name":         "interaudiosrc1" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create interaudiosrc1: %v", err)
 	}
 
 	interaudio2, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
-		"channel":      "audio2",
+		"channel":      "audio2" + s.schedulerID,
 		"do-timestamp": true,
+		"name":         "interaudiosrc2" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create interaudiosrc2: %v", err)
 	}
 
 	audiomixer, err := gst.NewElement("audiomixer")
+	audiomixer.SetProperty("name", "audiomixer" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audiomixer: %v", err)
 	}
 
 	audioconv, err := gst.NewElement("audioconvert")
+	audioconv.SetProperty("name", "audioconv" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
 	aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
 		"bitrate": 128000,
+		"name":    "aacenc" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create aacenc: %v", err)
@@ -227,6 +239,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"pat-interval": int64(100 * 1000000),
 		"pmt-interval": int64(100 * 1000000),
 		"pcr-interval": int64(20 * 1000000),
+		"name":         "mpegtsmux" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
@@ -236,6 +249,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"pt":              33,
 		"mtu":             1400,
 		"perfect-rtptime": true,
+		"name":           "rtpmp2tpay" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
@@ -247,6 +261,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"sync":           true,
 		"buffer-size":    524288,
 		"auto-multicast": true,
+		"name":           "udpsink" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create udpsink: %v", err)
@@ -258,6 +273,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "videoQueue1" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create videoQueue1: %v", err)
@@ -268,6 +284,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "videoQueue2" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create videoQueue2: %v", err)
@@ -278,6 +295,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "audioQueue1" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create audioQueue1: %v", err)
@@ -288,6 +306,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "audioQueue2" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create audioQueue2: %v", err)
@@ -299,6 +318,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "videoMixerQueue" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create videoMixerQueue: %v", err)
@@ -309,6 +329,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(500 * time.Millisecond),
 		"min-threshold-time": uint64(50 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "audioMixerQueue" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create audioMixerQueue: %v", err)
@@ -320,6 +341,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 		"max-size-time":      uint64(1 * time.Second),
 		"min-threshold-time": uint64(100 * time.Millisecond),
 		"leaky":              0, // No leaking
+		"name":               "muxerQueue" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create muxerQueue: %v", err)
@@ -327,22 +349,26 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	// Create audio converter elements for each input
 	audioconv1, err := gst.NewElement("audioconvert")
+	audioconv1.SetProperty("name", "audioconv1" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconv1: %v", err)
 	}
 
 	audioconv2, err := gst.NewElement("audioconvert")
+	audioconv2.SetProperty("name", "audioconv2" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioconv2: %v", err)
 	}
 
 	// Create audioresample elements to ensure rate compatibility
 	audioresample1, err := gst.NewElement("audioresample")
+	audioresample1.SetProperty("name", "audioresample1" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioresample1: %v", err)
 	}
 
 	audioresample2, err := gst.NewElement("audioresample")
+	audioresample2.SetProperty("name", "audioresample2" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audioresample2: %v", err)
 	}
@@ -350,6 +376,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	// Create capsfilters to explicitly set audio format
 	audiocaps1, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+		"name": "audiocaps1" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create audiocaps1: %v", err)
@@ -357,6 +384,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	audiocaps2, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+		"name": "audiocaps2" + s.schedulerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create audiocaps2: %v", err)
@@ -455,7 +483,7 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 
 	// Create video sink
 	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
-		"channel": channel,
+		"channel": channel + s.schedulerID,
 		"sync":    true,
 	})
 	if err != nil {
@@ -485,6 +513,7 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 
 	audiocaps, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+		"name": "audiocaps" + s.schedulerID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audiocaps: %v", err)
@@ -492,8 +521,9 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 
 	// Create audio sink with proper format
 	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
-		"channel": fmt.Sprintf("audio%s", channel[len(channel)-1:]),
+		"channel": fmt.Sprintf("audio%s", channel[len(channel)-1:]) + s.schedulerID,
 		"sync":    true,
+		"name":    "interaudiosink" + s.schedulerID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create interaudiosink: %v", err)
@@ -626,7 +656,7 @@ func (s *StreamScheduler) playCurrentItem(items []StreamItem) {
 	}
 
 	// Toggle visibility based on current channel
-	if channel == "input1" {
+	if channel == "input1" + s.schedulerID {
 
 		pad1 := s.compositor.GetStaticPad("sink_0")
 		pad2 := s.compositor.GetStaticPad("sink_1")
