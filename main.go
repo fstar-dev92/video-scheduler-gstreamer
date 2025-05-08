@@ -18,7 +18,7 @@ func main() {
 	gst.Init(nil)
 
 	// Create a new stream scheduler with output to localhost:5000
-	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.2", 9000)
+	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.5", 5000)
 	if err != nil {
 		log.Fatalf("Failed to create scheduler: %v", err)
 	}
@@ -54,7 +54,7 @@ func main() {
 	fmt.Println("Scheduler1 started. Press Ctrl+C to exit.")
 
 	// Create a new stream scheduler with output to localhost:5000
-	streamScheduler1, err := scheduler.NewStreamScheduler("239.1.1.2", 9001)
+	streamScheduler1, err := scheduler.NewStreamScheduler("239.1.1.8", 5001)
 	if err != nil {
 		log.Fatalf("Failed to create scheduler1: %v", err)
 	}
