@@ -656,7 +656,7 @@ func (s *StreamScheduler) playCurrentItem(items []StreamItem) {
 	}
 
 	// Toggle visibility based on current channel
-	if channel == "input1" + s.schedulerID {
+	if channel == "input1" {
 
 		pad1 := s.compositor.GetStaticPad("sink_0")
 		pad2 := s.compositor.GetStaticPad("sink_1")
