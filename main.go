@@ -21,7 +21,7 @@ func main() {
 	outputHost := flag.String("output-host", "239.8.8.8", "Output RTP stream host")
 	outputPort := flag.Int("output-port", 6000, "Output RTP stream port")
 	assetPath := flag.String("asset", "/home/fstar/work/video-scheduler-gstreamer/videos/input_cut.mp4", "Path to local asset video file")
-
+	hlslink := flag.String("hlslink", "https://1404062696.rsc.cdn77.org/HLS/FIDO_SCTE.m3u8", "Output RTP stream host")
 	flag.Parse()
 
 	// Validate asset file exists
@@ -42,7 +42,7 @@ func main() {
 
 	// Start the pipeline in a goroutine
 	go func() {
-		err := RunGStreamerPipeline(*inputHost, *inputPort, *outputHost, *outputPort, *assetPath)
+		err := RunHLSGStreamerPipeline(*hlslink, *outputHost, *outputPort, *assetPath)
 		if err != nil {
 			fmt.Printf("Pipeline error: %v", err)
 		}
